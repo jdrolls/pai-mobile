@@ -1,0 +1,30 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Data & Logs (runtime state)
+data/logs/*
+data/sessions.json
+!data/logs/.gitkeep
+
+# Node
+node_modules/
+
+# Build
+dist/
+*.tsbuildinfo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Plans (local only)
+Plans/
