@@ -1,3 +1,5 @@
+import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'fs';
+import { join } from 'path';
 import { config } from './config.js';
 import { log } from './logger.js';
 import { deleteWebhook, formatForTelegram, getUpdates, sendMessage, sendTyping, type TelegramUpdate } from './telegram.js';
@@ -16,6 +18,64 @@ let lastUpdateId: number | undefined;
 const processingChats = new Set<string>();
 const messageQueues = new Map<string, Array<{ text: string; chatId: number }>>();
 const activeControllers = new Map<string, AbortController>();
+
+// ─── Queue Persistence ──────────────────────────────────────────
+
+const QUEUE_PATH = join(config.dataDir, 'queue.json');
+
+type QueueStore = Record<string, Array<{ text: string; chatId: number }>>;
+
+function loadQueue(): void {
+  if (existsSync(QUEUE_PATH)) {
+    try {
+      const data: QueueStore = JSON.parse(readFileSync(QUEUE_PATH, 'utf-8'));
+      for (const [chatStr, items] of Object.entries(data)) {
+        if (items.length > 0) {
+          messageQueues.set(chatStr, items);
+          log('info', `Restored ${items.length} queued message(s) for chat ${chatStr}`);
+        }
+      }
+    } catch (e) {
+      log('warn', `Failed to parse queue file, starting fresh: ${e}`);
+    }
+  }
+}
+
+function saveQueue(): void {
+  const data: QueueStore = {};
+  for (const [chatStr, items] of messageQueues) {
+    if (items.length > 0) data[chatStr] = items;
+  }
+  const tmpPath = QUEUE_PATH + '.tmp';
+  try {
+    writeFileSync(tmpPath, JSON.stringify(data, null, 2));
+    renameSync(tmpPath, QUEUE_PATH); // Atomic on POSIX
+  } catch (e) {
+    log('error', `Failed to save queue: ${e}`);
+    try { unlinkSync(tmpPath); } catch { /* ignore */ }
+  }
+}
+
+// ─── Rate Limiting ──────────────────────────────────────────────
+
+const messageTimestamps = new Map<string, number[]>();
+let activeClaude = 0;
+
+function isRateLimited(chatStr: string): boolean {
+  const now = Date.now();
+  const windowMs = 60_000;
+  const timestamps = messageTimestamps.get(chatStr) ?? [];
+  // Remove timestamps outside the window
+  const recent = timestamps.filter(t => now - t < windowMs);
+  messageTimestamps.set(chatStr, recent);
+  return recent.length >= config.maxMessagesPerMinute;
+}
+
+function recordMessage(chatStr: string): void {
+  const timestamps = messageTimestamps.get(chatStr) ?? [];
+  timestamps.push(Date.now());
+  messageTimestamps.set(chatStr, timestamps);
+}
 
 // ─── Command Handling ───────────────────────────────────────────
 
@@ -90,6 +150,7 @@ async function handleCommand(chatId: number, command: string, args: string): Pro
         processingChats.delete(chatStr);
         const queueSize = messageQueues.get(chatStr)?.length ?? 0;
         messageQueues.delete(chatStr);
+        saveQueue();
         activeControllers.delete(chatStr);
         return `Cancelled current task${queueSize > 0 ? ` and cleared ${queueSize} queued message(s)` : ''}.`;
       }
@@ -150,11 +211,20 @@ async function processMessage(chatId: number, text: string): Promise<void> {
     // If not a recognized command, treat as a regular message
   }
 
+  // Rate limit check
+  if (isRateLimited(chatStr)) {
+    log('warn', `Rate limited chat ${chatStr}`);
+    await sendMessage(chatId, 'Slow down \u2014 too many messages. Try again in a minute.');
+    return;
+  }
+  recordMessage(chatStr);
+
   // Check if already processing for this chat
   if (processingChats.has(chatStr)) {
     // Queue the message
     if (!messageQueues.has(chatStr)) messageQueues.set(chatStr, []);
     messageQueues.get(chatStr)!.push({ text, chatId });
+    saveQueue();
     await sendMessage(chatId, '\ud83d\udcac Queued \u2014 I\'ll get to this when my current task finishes.');
     log('info', `Queued message for chat ${chatStr}`);
     return;
@@ -175,6 +245,19 @@ async function processMessage(chatId: number, text: string): Promise<void> {
     }, config.longTaskThresholdMs);
 
     try {
+      // Concurrent Claude process limit
+      if (activeClaude >= config.maxConcurrentClaude) {
+        log('warn', `Concurrent Claude limit reached (${activeClaude}/${config.maxConcurrentClaude})`);
+        if (!messageQueues.has(chatStr)) messageQueues.set(chatStr, []);
+        messageQueues.get(chatStr)!.push({ text, chatId });
+        saveQueue();
+        await sendMessage(chatId, '\ud83d\udcac Queued \u2014 processing limit reached, I\'ll get to this shortly.');
+        processingChats.delete(chatStr);
+        activeControllers.delete(chatStr);
+        return;
+      }
+      activeClaude++;
+
       const session = getOrCreateSession(chatStr);
 
       // Auto-name session from first message
@@ -215,6 +298,7 @@ async function processMessage(chatId: number, text: string): Promise<void> {
     log('error', `Error processing message: ${e}`);
     await sendMessage(chatId, `Something went wrong: ${String(e).slice(0, 200)}`);
   } finally {
+    activeClaude = Math.max(0, activeClaude - 1);
     processingChats.delete(chatStr);
     activeControllers.delete(chatStr);
 
@@ -223,6 +307,7 @@ async function processMessage(chatId: number, text: string): Promise<void> {
     if (queue && queue.length > 0) {
       const next = queue.shift()!;
       if (queue.length === 0) messageQueues.delete(chatStr);
+      saveQueue();
       log('info', `Draining queue for chat ${chatStr}, ${queue?.length ?? 0} remaining`);
       // Process next message (recursive but not stack-deep due to async)
       await processMessage(next.chatId, next.text);
@@ -290,8 +375,25 @@ async function main(): Promise<void> {
 \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d
 `);
 
-  // Load session state
+  // Load session state and persisted queue
   loadSessions();
+  loadQueue();
+
+  // Drain any queued messages from previous crash
+  if (messageQueues.size > 0) {
+    // Snapshot and clear — processMessage handles its own queue logic
+    const snapshot = new Map(messageQueues);
+    messageQueues.clear();
+    saveQueue();
+    for (const [chatStr, items] of snapshot) {
+      log('info', `Resuming ${items.length} queued message(s) for chat ${chatStr} from previous session`);
+      for (const item of items) {
+        processMessage(item.chatId, item.text).catch(e => {
+          log('error', `Failed to resume queued message: ${e}`);
+        });
+      }
+    }
+  }
 
   // Clear any existing webhook (prevents polling conflict)
   try {

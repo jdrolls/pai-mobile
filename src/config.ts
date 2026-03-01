@@ -40,7 +40,7 @@ export const config = {
 
   // Claude Code
   claudeCwd: homedir(), // Run claude from home dir for full context access
-  claudePermissionMode: (process.env.PERMISSION_MODE ?? 'bypassPermissions') as string,
+  claudePermissionMode: (process.env.PERMISSION_MODE ?? 'default') as string,
 
   // Telegram limits
   telegramMsgLimit: 4000,
@@ -51,6 +51,10 @@ export const config = {
   liteTimeoutMs: 120_000,       // 2 min for lite mode
   fullTimeoutMs: 10 * 60_000,   // 10 min for full mode
   longTaskThresholdMs: 15_000,  // 15s before sending "this will take a bit" ping
+
+  // Rate limits
+  maxMessagesPerMinute: parseInt(process.env.MAX_MESSAGES_PER_MINUTE ?? '20', 10),
+  maxConcurrentClaude: parseInt(process.env.MAX_CONCURRENT_CLAUDE ?? '3', 10),
 
   // Models
   liteModel: process.env.LITE_MODEL ?? 'sonnet',

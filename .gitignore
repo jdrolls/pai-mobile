@@ -6,6 +6,7 @@
 # Data & Logs (runtime state)
 data/logs/*
 data/sessions.json
+data/queue.json
 !data/logs/.gitkeep
 
 # Node

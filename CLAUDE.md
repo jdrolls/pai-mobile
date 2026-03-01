@@ -54,9 +54,13 @@ All config via `.env` in project root. See `.env.example` for full list.
 
 Identity (`BOT_NAME`, `USER_NAME`) is injected into prompt templates at runtime via `{{placeholder}}` replacement.
 
+## Permission Mode
+
+Default is `default` — Claude asks for confirmation on risky actions. Users can opt into `acceptEdits` or `bypassPermissions` via `PERMISSION_MODE` in `.env`. The safe default protects against compromised Telegram accounts gaining unrestricted shell access.
+
 ## Session Management
 
-- Sessions stored at `data/sessions.json`
+- Sessions stored at `data/sessions.json` using atomic writes (write to `.tmp`, then rename)
 - **Lite mode is STATELESS** — no `--resume`, fresh system prompt every message. Prevents poisoned context carryover.
 - **Full mode uses `--resume`** for conversation continuity via `claudeSessionId`
 - Auto-naming: first message content becomes session name
@@ -64,13 +68,20 @@ Identity (`BOT_NAME`, `USER_NAME`) is injected into prompt templates at runtime 
 ## Message Queue & Cancellation
 
 - Messages received while processing are queued with "Queued" notification
+- **Queue is persisted to `data/queue.json`** — survives crashes, reloaded on startup
 - Queue drains FIFO after current task completes
 - `/cancel` kills current `claude -p` process via AbortController and clears queue
 - Long tasks (>15s) trigger a "taking a few minutes" notification
 
+## Rate Limiting
+
+- Per-chat: max `MAX_MESSAGES_PER_MINUTE` messages in a 60s sliding window (default: 20)
+- Global: max `MAX_CONCURRENT_CLAUDE` simultaneous `claude -p` processes (default: 3)
+- Rate-limited messages get a friendly rejection; excess concurrent requests are queued
+
 ## Self-Modification Protection
 
-The full-system.md prompt explicitly forbids Claude from modifying the bot's own source files or restarting the gateway. This prevents a loop where `claude -p` with `bypassPermissions` edits source → restarts bot → kills itself → user never gets response.
+The full-system.md prompt explicitly forbids Claude from modifying the bot's own source files or restarting the gateway. This prevents a loop where `claude -p` edits source → restarts bot → kills itself → user never gets response.
 
 ## Known Gotchas
 

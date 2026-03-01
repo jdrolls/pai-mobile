@@ -64,7 +64,7 @@ All configuration lives in `.env`:
 | `TELEGRAM_CHAT_ID` | **Yes** | — | Comma-separated authorized chat IDs |
 | `LITE_MODEL` | No | `sonnet` | Claude model for lite mode |
 | `FULL_MODEL` | No | `sonnet` | Claude model for full mode |
-| `PERMISSION_MODE` | No | `bypassPermissions` | Claude Code permission mode |
+| `PERMISSION_MODE` | No | `default` | Claude Code permission mode (`default`, `acceptEdits`, `bypassPermissions`) |
 
 ## Commands
 
@@ -123,9 +123,10 @@ Edit `src/classifier.ts` to tune which messages route to lite vs full mode. The 
 ## Security Notes
 
 - Only chat IDs listed in `TELEGRAM_CHAT_ID` can interact with the bot
-- The bot runs `claude -p` with `bypassPermissions` — authentication is handled at the Telegram level
+- **Default permission mode is `default`** — Claude will ask for confirmation before risky actions (file edits, shell commands). You can change this to `acceptEdits` or `bypassPermissions` in your `.env`, but understand the implications: a compromised Telegram account would gain whatever permissions you grant
 - The full mode system prompt includes self-modification protection to prevent Claude from accidentally restarting the bot
 - Never commit your `.env` file (it's in `.gitignore`)
+- Rate limiting is enforced per-chat to prevent resource exhaustion
 
 ## License
 

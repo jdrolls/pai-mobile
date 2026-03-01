@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { config } from './config.js';
 import { log } from './logger.js';
@@ -36,7 +36,15 @@ export function loadSessions(): void {
 }
 
 function saveSessions(): void {
-  writeFileSync(STORE_PATH, JSON.stringify(store, null, 2));
+  const tmpPath = STORE_PATH + '.tmp';
+  try {
+    writeFileSync(tmpPath, JSON.stringify(store, null, 2));
+    renameSync(tmpPath, STORE_PATH); // Atomic on POSIX
+  } catch (e) {
+    log('error', `Failed to save sessions: ${e}`);
+    // Clean up temp file if rename failed
+    try { unlinkSync(tmpPath); } catch { /* ignore */ }
+  }
 }
 
 function generateId(): string {
