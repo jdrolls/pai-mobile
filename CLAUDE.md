@@ -1,17 +1,21 @@
-# PAI Mobile Integration
+# PAI Mobile Gateway
 
-Telegram bot that routes messages to Claude Code CLI (`claude -p`) with dual-mode routing and multi-session management.
+Telegram bot that routes messages to Claude Code CLI (`claude -p`) with dual-mode routing, multi-session management, heartbeat monitoring, and cron scheduling.
 
 ## Architecture
 
 ```
 Telegram → index.ts (polling) → classifier.ts (keyword heuristic)
-                                   ├── lite.ts → claude -p (stateless, no resume)
-                                   └── full.ts → claude -p (session resume)
+                                   ├── lite.ts → claude -p (sonnet, lite system prompt)
+                                   └── full.ts → claude -p (sonnet, full system prompt)
                                         ↓
                               claude-runner.ts (shared CLI spawner)
                                         ↓
                               sessions.ts (state persistence)
+
+Proactive:
+  heartbeat.ts (timer) → claude -p (stateless, read-only) → outbound-queue.ts → Telegram
+  cron.ts (scheduler)  → claude -p (stateless, isolated)  → outbound-queue.ts → Telegram
 ```
 
 **All inference goes through `claude -p` CLI** — no direct Anthropic API calls. Uses Claude Max plan auth, not API billing.
@@ -20,18 +24,24 @@ Telegram → index.ts (polling) → classifier.ts (keyword heuristic)
 
 | File | Purpose |
 |------|---------|
-| `src/index.ts` | Main loop: Telegram polling, auth, commands, message queue, cancellation |
-| `src/config.ts` | Loads `.env`, derives paths from project root, exports config |
-| `src/claude-runner.ts` | Spawns `claude -p` with clean env. ALL modes route through here |
+| `src/index.ts` | Main loop: Telegram polling, auth, commands, message queue, proactive startup |
+| `src/claude-runner.ts` | Spawns `claude -p` with clean env. ALL modes route through here. Allowlist env for system sessions |
 | `src/classifier.ts` | Synchronous keyword regex → lite/full routing. Zero overhead |
 | `src/lite.ts` | Lite mode handler — STATELESS (no session resume) |
 | `src/full.ts` | Full mode handler with session resume |
-| `src/sessions.ts` | Multi-session state: create, switch, list, persist to disk |
 | `src/telegram.ts` | Telegram API: polling, send, typing, chunking, MD→HTML formatting |
+| `src/sessions.ts` | Multi-session state: create, switch, list, persist to disk |
+| `src/heartbeat.ts` | Periodic AI check-in — reads HEARTBEAT.md, alerts only when actionable |
+| `src/cron.ts` | Scheduled task executor — natural language schedules, skip-if-running, backoff |
+| `src/outbound-queue.ts` | Single async sender — bundling, rate limiting, retry for all outbound |
+| `src/config.ts` | Loads `.env` + heartbeat config from project root, validates |
 | `src/logger.ts` | File + console logger |
-| `prompts/lite-system.md` | Lite mode system prompt (uses {{BOT_NAME}}/{{USER_NAME}} placeholders) |
+| `prompts/lite-system.md` | Lite mode system prompt (uses `{{BOT_NAME}}`/`{{USER_NAME}}` placeholders) |
 | `prompts/full-system.md` | Full mode system prompt with self-modification protection |
+| `data/heartbeat-config.json` | Heartbeat config: interval, active hours, model, circuit breaker |
+| `data/cron/jobs.json` | Persistent cron job store |
 | `manage.sh` | Service lifecycle: install/start/stop/restart/status/logs/dev |
+| `com.pai-mobile.plist.example` | launchd auto-start config template |
 
 ## Critical: Spawning `claude -p`
 
@@ -58,6 +68,40 @@ Identity (`BOT_NAME`, `USER_NAME`) is injected into prompt templates at runtime 
 
 Default is `default` — Claude asks for confirmation on risky actions. Users can opt into `acceptEdits` or `bypassPermissions` via `PERMISSION_MODE` in `.env`. The safe default protects against compromised Telegram accounts gaining unrestricted shell access.
 
+System sessions (heartbeat, cron) always use `default` permission mode with an allowlist env that strips all secrets.
+
+## Heartbeat System
+
+- **Stateless** — every tick is a fresh `claude -p` with `--no-session-persistence`. Never `--resume`.
+- **HEARTBEAT.md is read-only** — the runner reads the file and passes content as context. AI cannot write to it.
+- **Allowlist env** — system sessions only get HOME, PATH, USER, TMPDIR, TERM, LANG, SHELL, CLAUDE_CONFIG_DIR. Bot token and all secrets are stripped.
+- **HEARTBEAT_OK = silence** — only actionable alerts reach Telegram. Prevents alarm fatigue.
+- **Circuit breaker** — 3 consecutive failures pause heartbeat for 1 hour, sends one alert about the pause.
+- **Active hours** — only runs during configured window (default 07:00-22:00).
+- **Defers to user** — skips tick if any user message is being processed.
+- Config: `data/heartbeat-config.json` (copy from `data/heartbeat-config.example.json`)
+- Checklist: `~/.claude/HEARTBEAT.md`
+
+## Cron System
+
+- **Natural language schedules** — "daily 7am", "every 2h", "weekdays 9am", "weekly monday 8am", "monthly 1st 9am", or raw cron expressions.
+- **Stateless** — each job runs with `--no-session-persistence` and allowlist env.
+- **Skip-if-running** — prevents concurrent executions of the same job.
+- **Exponential backoff** — 30s, 1m, 5m, 15m, 1h on consecutive failures.
+- **5-minute minimum interval** — prevents runaway schedules.
+- **Max 20 jobs** — hard limit to prevent resource exhaustion.
+- **Hot-reload** — gateway detects external changes to `jobs.json` via mtime, reloads within 60s.
+- **deleteAfterRun** — one-shot jobs auto-remove after successful execution.
+- Job store: `data/cron/jobs.json`
+
+## Outbound Queue
+
+- **Single async sender** — all system messages (heartbeat, cron) route through outbound-queue.ts.
+- **Bundling** — messages from same source within 15s window are combined (5 cron jobs at 8am = 1 Telegram message, not 5).
+- **Rate limiting** — 1s spacing between sends to respect Telegram limits.
+- **Retry** — 3 attempts with exponential backoff on send failure.
+- Source prefixes: heartbeat=heart, cron=alarm clock.
+
 ## Session Management
 
 - Sessions stored at `data/sessions.json` using atomic writes (write to `.tmp`, then rename)
@@ -79,9 +123,21 @@ Default is `default` — Claude asks for confirmation on risky actions. Users ca
 - Global: max `MAX_CONCURRENT_CLAUDE` simultaneous `claude -p` processes (default: 3)
 - Rate-limited messages get a friendly rejection; excess concurrent requests are queued
 
-## Self-Modification Protection
+## Reliability
 
-The full-system.md prompt explicitly forbids Claude from modifying the bot's own source files or restarting the gateway. This prevents a loop where `claude -p` edits source → restarts bot → kills itself → user never gets response.
+- **Atomic file writes** — sessions.json and queue.json use write-to-tmp-then-rename (atomic on POSIX)
+- **`activeClaude` counter** — tracks concurrent processes, decrements in `finally` with `Math.max(0, n-1)` safety
+- **`lastUpdateId` persistence** — Telegram update offset saved to `data/last-update-id`, prevents re-processing messages after restart
+
+## Commands
+
+`/new [name]`, `/sessions`, `/switch <id>`, `/lite`, `/full`, `/auto`, `/cancel`, `/status`, `/help`
+
+**Proactive commands:** `/heartbeat`, `/cron [list|add|remove|toggle|run]`, `/pause`, `/resume`
+
+- `/pause` — stops ALL proactive behavior (heartbeat + cron) with one command
+- `/resume` — restarts proactive behavior
+- `/cron add "name" "schedule" "prompt"` — create a cron job with natural language schedule
 
 ## Known Gotchas
 

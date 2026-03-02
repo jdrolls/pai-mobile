@@ -24,6 +24,27 @@ if (existsSync(envPath)) {
   }
 }
 
+// Load heartbeat config
+const heartbeatConfigPath = join(PROJECT_DIR, 'data', 'heartbeat-config.json');
+let heartbeatConfig = {
+  enabled: false,
+  intervalMs: 3600000,
+  activeHours: { start: '07:00', end: '22:00' },
+  timezone: process.env.TIMEZONE ?? 'America/Denver',
+  model: 'sonnet',
+  heartbeatMdPath: '~/.claude/HEARTBEAT.md',
+  ackMaxChars: 300,
+  maxConsecutiveFailures: 3,
+  circuitBreakerPauseMs: 3600000,
+};
+if (existsSync(heartbeatConfigPath)) {
+  try {
+    heartbeatConfig = JSON.parse(readFileSync(heartbeatConfigPath, 'utf-8'));
+  } catch (e) {
+    console.warn(`Failed to parse heartbeat config: ${e}`);
+  }
+}
+
 export const config = {
   // Identity
   botName: process.env.BOT_NAME ?? 'PAI Mobile',
@@ -38,6 +59,10 @@ export const config = {
   dataDir: join(PROJECT_DIR, 'data'),
   promptDir: join(PROJECT_DIR, 'prompts'),
 
+  // Heartbeat + Cron
+  heartbeat: heartbeatConfig,
+  timezone: process.env.TIMEZONE ?? 'America/Denver',
+
   // Claude Code
   claudeCwd: homedir(), // Run claude from home dir for full context access
   claudePermissionMode: (process.env.PERMISSION_MODE ?? 'default') as string,
@@ -50,6 +75,7 @@ export const config = {
   // Timeouts
   liteTimeoutMs: 120_000,       // 2 min for lite mode
   fullTimeoutMs: 10 * 60_000,   // 10 min for full mode
+  classifierTimeoutMs: 60_000,  // 60s for classifier
   longTaskThresholdMs: 15_000,  // 15s before sending "this will take a bit" ping
 
   // Rate limits
@@ -57,6 +83,7 @@ export const config = {
   maxConcurrentClaude: parseInt(process.env.MAX_CONCURRENT_CLAUDE ?? '3', 10),
 
   // Models
+  classifierModel: 'haiku',
   liteModel: process.env.LITE_MODEL ?? 'sonnet',
   fullModel: process.env.FULL_MODEL ?? 'sonnet',
 } as const;

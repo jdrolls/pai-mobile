@@ -26,9 +26,10 @@ export interface ClaudeRunOptions {
   noSessionPersistence?: boolean;
   timeoutMs?: number;
   signal?: AbortSignal;
+  systemSession?: boolean;
 }
 
-/** Build a clean env with all Claude Code vars stripped */
+/** Build a clean env with all Claude Code vars stripped (for user sessions) */
 function cleanEnv(): Record<string, string> {
   const env = { ...process.env } as Record<string, string>;
   // Remove ALL Claude Code session markers
@@ -38,6 +39,16 @@ function cleanEnv(): Record<string, string> {
   delete env.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
   // Remove API key so claude uses Max plan auth instead of API billing
   delete env.ANTHROPIC_API_KEY;
+  return env;
+}
+
+/** Build a minimal allowlist env for automated/system sessions (heartbeat, cron) */
+function cleanEnvForAutomated(): Record<string, string> {
+  const ALLOWED = ['HOME', 'PATH', 'USER', 'TMPDIR', 'TERM', 'LANG', 'SHELL', 'CLAUDE_CONFIG_DIR'];
+  const env: Record<string, string> = {};
+  for (const key of ALLOWED) {
+    if (process.env[key]) env[key] = process.env[key]!;
+  }
   return env;
 }
 
@@ -60,8 +71,12 @@ export async function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult
     args.push('--no-session-persistence');
   }
 
-  // Automated usage — auth is handled at Telegram level
-  args.push('--permission-mode', config.claudePermissionMode);
+  // Permission mode: restricted for system sessions, configurable for user sessions
+  if (opts.systemSession) {
+    args.push('--permission-mode', 'default');
+  } else {
+    args.push('--permission-mode', config.claudePermissionMode);
+  }
 
   log('info', `Running: claude -p "${opts.message.slice(0, 50)}..." --model ${opts.model ?? config.fullModel}`);
 
@@ -73,7 +88,7 @@ export async function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult
 
     const proc = spawn('claude', args, {
       cwd: config.claudeCwd,
-      env: cleanEnv(),
+      env: opts.systemSession ? cleanEnvForAutomated() : cleanEnv(),
       stdio: ['ignore', 'pipe', 'pipe'],  // stdin must be 'ignore' — 'pipe' blocks claude
     });
 

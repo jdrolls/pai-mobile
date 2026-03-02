@@ -1,0 +1,11 @@
+{
+  "enabled": false,
+  "intervalMs": 3600000,
+  "activeHours": { "start": "07:00", "end": "22:00" },
+  "timezone": "America/Denver",
+  "model": "sonnet",
+  "heartbeatMdPath": "~/.claude/HEARTBEAT.md",
+  "ackMaxChars": 300,
+  "maxConsecutiveFailures": 3,
+  "circuitBreakerPauseMs": 3600000
+}

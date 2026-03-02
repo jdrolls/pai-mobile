@@ -11,13 +11,9 @@ import {
   listSessions, switchSession, setModeOverride,
   updateSession, autoNameSession, type Session,
 } from './sessions.js';
-
-// ─── State ──────────────────────────────────────────────────────
-
-let lastUpdateId: number | undefined;
-const processingChats = new Set<string>();
-const messageQueues = new Map<string, Array<{ text: string; chatId: number }>>();
-const activeControllers = new Map<string, AbortController>();
+import { startHeartbeat, stopHeartbeat, pauseHeartbeat, resumeHeartbeat, getHeartbeatStatus } from './heartbeat.js';
+import { startCron, stopCron, pauseCron, resumeCron, addJob, removeJob, toggleJob, listJobs, runJobNow, type CronJob } from './cron.js';
+import { stopOutboundQueue } from './outbound-queue.js';
 
 // ─── Queue Persistence ──────────────────────────────────────────
 
@@ -75,6 +71,33 @@ function recordMessage(chatStr: string): void {
   const timestamps = messageTimestamps.get(chatStr) ?? [];
   timestamps.push(Date.now());
   messageTimestamps.set(chatStr, timestamps);
+}
+
+// ─── State ──────────────────────────────────────────────────────
+
+const LAST_UPDATE_PATH = join(config.dataDir, 'last-update-id');
+let lastUpdateId: number | undefined;
+const processingChats = new Set<string>();
+const messageQueues = new Map<string, Array<{ text: string; chatId: number }>>();
+const activeControllers = new Map<string, AbortController>();
+let proactivePaused = false;
+
+function loadLastUpdateId(): void {
+  if (existsSync(LAST_UPDATE_PATH)) {
+    try {
+      const val = parseInt(readFileSync(LAST_UPDATE_PATH, 'utf-8').trim(), 10);
+      if (!isNaN(val)) lastUpdateId = val;
+    } catch { /* start fresh */ }
+  }
+}
+
+function saveLastUpdateId(id: number): void {
+  try { writeFileSync(LAST_UPDATE_PATH, String(id)); } catch { /* best effort */ }
+}
+
+/** Returns true if any user message is currently being processed */
+export function isUserProcessing(): boolean {
+  return processingChats.size > 0;
 }
 
 // ─── Command Handling ───────────────────────────────────────────
@@ -157,6 +180,87 @@ async function handleCommand(chatId: number, command: string, args: string): Pro
       return 'Nothing to cancel \u2014 no task in progress.';
     }
 
+    case '/heartbeat': {
+      const hb = getHeartbeatStatus();
+      const nextIn = hb.nextRunEstimate > Date.now()
+        ? `${Math.round((hb.nextRunEstimate - Date.now()) / 60_000)}m`
+        : 'now';
+      return [
+        '*Heartbeat Status:*',
+        `Enabled: ${hb.enabled}`,
+        `Paused: ${hb.paused || proactivePaused}`,
+        `Last run: ${hb.lastRunAt ? formatAge(hb.lastRunAt) : 'never'}`,
+        `Next: ~${nextIn}`,
+        `Failures: ${hb.consecutiveFailures}`,
+        `Circuit breaker: ${hb.circuitBreakerActive ? 'ACTIVE' : 'off'}`,
+      ].join('\n');
+    }
+
+    case '/pause': {
+      proactivePaused = true;
+      pauseHeartbeat();
+      pauseCron();
+      return 'All proactive behavior paused (heartbeat + cron). Use /resume to restart.';
+    }
+
+    case '/resume': {
+      proactivePaused = false;
+      resumeHeartbeat();
+      resumeCron();
+      return 'Proactive behavior resumed (heartbeat + cron).';
+    }
+
+    case '/cron': {
+      const subCmd = args.trim().split(/\s+/);
+      const action = subCmd[0]?.toLowerCase();
+
+      if (!action || action === 'list') {
+        const jobs = listJobs();
+        if (jobs.length === 0) return 'No cron jobs. Use /cron add "name" "schedule" "prompt" to create one.';
+        const lines = jobs.map(j => {
+          const status = j.enabled ? '\u2705' : '\u23f8';
+          const lastRun = j.state.lastRunAtMs ? formatAge(j.state.lastRunAtMs) : 'never';
+          return `${status} *${j.name}* (${j.id})\n   ${j.schedule.kind}: ${j.schedule.expr}\n   Last: ${lastRun} | Errors: ${j.state.consecutiveErrors}`;
+        });
+        return `*Cron Jobs (${jobs.length}):*\n${lines.join('\n\n')}`;
+      }
+
+      if (action === 'add') {
+        // /cron add "name" "schedule" "prompt"
+        const parts = args.slice(3).trim().match(/"([^"]+)"/g);
+        if (!parts || parts.length < 3) {
+          return 'Usage: /cron add "job name" "schedule" "prompt"\nSchedule examples: "daily 7am", "every 2h", "weekdays 9am"';
+        }
+        const [name, schedule, message] = parts.map(p => p.replace(/"/g, ''));
+        const result = addJob(name, schedule, message);
+        if ('error' in result) return `Error: ${result.error}`;
+        return `Created cron job: *${result.name}* (${result.id})\nSchedule: ${result.schedule.expr}`;
+      }
+
+      if (action === 'remove' || action === 'delete') {
+        const id = subCmd[1];
+        if (!id) return 'Usage: /cron remove <id>';
+        return removeJob(id) ? `Removed job ${id}` : `Job not found: ${id}`;
+      }
+
+      if (action === 'toggle') {
+        const id = subCmd[1];
+        if (!id) return 'Usage: /cron toggle <id>';
+        const job = toggleJob(id);
+        if (!job) return `Job not found: ${id}`;
+        return `Job *${job.name}* is now ${job.enabled ? 'enabled' : 'disabled'}`;
+      }
+
+      if (action === 'run') {
+        const id = subCmd[1];
+        if (!id) return 'Usage: /cron run <id>';
+        const result = await runJobNow(id);
+        return result;
+      }
+
+      return 'Usage: /cron [list|add|remove|toggle|run]\n/cron add "name" "schedule" "prompt"';
+    }
+
     case '/help': {
       return [
         `*${config.botName} Commands:*`,
@@ -169,12 +273,14 @@ async function handleCommand(chatId: number, command: string, args: string): Pro
         '/auto \u2014 Restore auto-detect mode',
         '/cancel \u2014 Cancel current task and clear queue',
         '/status \u2014 Current session info',
-        '/help \u2014 This message',
         '',
-        '*Modes:*',
-        '\u00b7 LITE \u2014 Direct inference, fast, for simple tasks',
-        '\u00b7 FULL \u2014 Claude Code with tools, for complex work',
-        '\u00b7 Auto-detect routes based on your message',
+        '*Proactive:*',
+        '/heartbeat \u2014 Heartbeat status',
+        '/cron \u2014 Manage cron jobs',
+        '/pause \u2014 Pause all proactive behavior',
+        '/resume \u2014 Resume proactive behavior',
+        '',
+        '/help \u2014 This message',
       ].join('\n');
     }
 
@@ -326,6 +432,7 @@ async function pollLoop(): Promise<void> {
 
       for (const update of updates) {
         lastUpdateId = update.update_id + 1;
+        saveLastUpdateId(lastUpdateId);
 
         if (update.message?.text) {
           // Fire and forget — don't block polling on processing
@@ -363,21 +470,24 @@ function formatAge(timestamp: number): string {
 // ─── Startup ────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
+  const hbStatus = config.heartbeat.enabled ? 'ON' : 'OFF';
   console.log(`
 \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
-\u2551  PAI Mobile Integration                  \u2551
+\u2551  PAI Mobile Gateway v2.0                  \u2551
 \u2551  Telegram \u2192 Claude Code Bridge              \u2551
 \u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563
 \u2551  Bot: ${(config.botName + '                    ').slice(0, 20)}                \u2551
 \u2551  Lite: ${(config.liteModel + '                   ').slice(0, 19)}                \u2551
 \u2551  Full: ${(config.fullModel + '                   ').slice(0, 19)}                \u2551
+\u2551  Heartbeat: ${hbStatus.padEnd(28)}\u2551
 \u2551  Auth: ${String(config.authorizedChatIds.length) + ' chat(s)              '.slice(0, 19)}                \u2551
 \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d
 `);
 
-  // Load session state and persisted queue
+  // Load persisted state
   loadSessions();
   loadQueue();
+  loadLastUpdateId();
 
   // Drain any queued messages from previous crash
   if (messageQueues.size > 0) {
@@ -403,20 +513,28 @@ async function main(): Promise<void> {
     log('warn', `Failed to clear webhook: ${e}`);
   }
 
+  // Start proactive systems
+  const primaryChatId = config.authorizedChatIds[0];
+  if (primaryChatId) {
+    startHeartbeat(config.heartbeat, primaryChatId, isUserProcessing);
+    startCron(config.dataDir, primaryChatId, isUserProcessing);
+  }
+
   // Start polling
   await pollLoop();
 }
 
 // Handle graceful shutdown
-process.on('SIGINT', () => {
-  log('info', 'Received SIGINT, shutting down...');
+function shutdown(signal: string): void {
+  log('info', `Received ${signal}, shutting down...`);
+  stopHeartbeat();
+  stopCron();
+  stopOutboundQueue();
   process.exit(0);
-});
+}
 
-process.on('SIGTERM', () => {
-  log('info', 'Received SIGTERM, shutting down...');
-  process.exit(0);
-});
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 main().catch(e => {
   log('error', `Fatal error: ${e}`);

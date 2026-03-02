@@ -1,11 +1,14 @@
 {
   "name": "pai-mobile",
-  "version": "1.0.0",
-  "description": "PAI Mobile Integration — Telegram interface to Claude Code with dual-mode routing",
+  "version": "2.0.0",
+  "description": "PAI Mobile Gateway — Telegram interface to Claude Code with dual-mode routing, heartbeat, and cron",
   "type": "module",
   "scripts": {
     "start": "tsx src/index.ts",
     "dev": "tsx --watch src/index.ts"
+  },
+  "dependencies": {
+    "cron-parser": "^5.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

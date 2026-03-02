@@ -7,7 +7,10 @@
 data/logs/*
 data/sessions.json
 data/queue.json
+data/heartbeat-config.json
+data/last-update-id
 !data/logs/.gitkeep
+!data/heartbeat-config.example.json
 
 # Node
 node_modules/
