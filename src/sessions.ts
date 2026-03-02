@@ -12,6 +12,7 @@ export interface Session {
   messageCount: number;
   createdAt: number;
   lastActive: number;
+  contextRecovery?: boolean; // True when --resume failed and transcript should be injected
 }
 
 interface SessionStore {

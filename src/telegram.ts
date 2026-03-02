@@ -1,6 +1,26 @@
+import { writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join, extname } from 'path';
 import { config } from './config.js';
 
 const BASE_URL = `https://api.telegram.org/bot${config.telegramToken}`;
+const FILE_BASE_URL = `https://api.telegram.org/file/bot${config.telegramToken}`;
+
+export interface TelegramPhoto {
+  file_id: string;
+  file_unique_id: string;
+  width: number;
+  height: number;
+  file_size?: number;
+}
+
+export interface TelegramDocument {
+  file_id: string;
+  file_unique_id: string;
+  file_name?: string;
+  mime_type?: string;
+  file_size?: number;
+}
 
 export interface TelegramUpdate {
   update_id: number;
@@ -10,6 +30,9 @@ export interface TelegramUpdate {
     chat: { id: number; type: string };
     date: number;
     text?: string;
+    caption?: string;
+    photo?: TelegramPhoto[];
+    document?: TelegramDocument;
   };
 }
 
@@ -36,6 +59,54 @@ async function apiCall<T>(method: string, body?: Record<string, unknown>, timeou
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** Resolve a Telegram file_id to a server-side file path for download */
+async function getFilePath(fileId: string): Promise<string> {
+  const result = await apiCall<{ file_path: string }>('getFile', { file_id: fileId });
+  return result.file_path;
+}
+
+/**
+ * Download a photo or image document from a Telegram message to /tmp/.
+ * Returns the local file path on success, null if the message has no image,
+ * or an unsupported marker if it's a non-image document type.
+ */
+export async function downloadTelegramImage(
+  message: NonNullable<TelegramUpdate['message']>
+): Promise<{ path: string } | { unsupported: string } | null> {
+  let fileId: string;
+  let ext = '.jpg';
+
+  if (message.photo && message.photo.length > 0) {
+    // Telegram sends multiple resolutions — last is highest quality
+    fileId = message.photo[message.photo.length - 1].file_id;
+    ext = '.jpg';
+  } else if (message.document) {
+    const mime = message.document.mime_type ?? '';
+    if (!mime.startsWith('image/')) {
+      // Non-image document — caller should send a user-facing message
+      return { unsupported: mime || 'unknown type' };
+    }
+    fileId = message.document.file_id;
+    // Preserve original extension if available
+    const origExt = message.document.file_name ? extname(message.document.file_name) : '';
+    ext = origExt || (mime === 'image/png' ? '.png' : mime === 'image/gif' ? '.gif' : '.jpg');
+  } else {
+    return null; // No image in this message
+  }
+
+  const filePath = await getFilePath(fileId);
+  const downloadUrl = `${FILE_BASE_URL}/${filePath}`;
+
+  const res = await fetch(downloadUrl);
+  if (!res.ok) throw new Error(`Failed to download image: ${res.status} ${res.statusText}`);
+
+  const buffer = Buffer.from(await res.arrayBuffer());
+  const localPath = join(tmpdir(), `pai-mobile-img-${Date.now()}${ext}`);
+  writeFileSync(localPath, buffer);
+
+  return { path: localPath };
 }
 
 export async function getUpdates(offset?: number): Promise<TelegramUpdate[]> {
@@ -106,7 +177,7 @@ export function formatForTelegram(text: string): string {
   // 3. Escape HTML entities in plain text (placeholders use \x00 — safe)
   result = escapeHtml(result);
 
-  // 4. Apply markdown → HTML conversions
+  // 4. Apply markdown -> HTML conversions
   // Headers
   result = result.replace(/^#{1,3} (.+)$/gm, '<b>$1</b>');
   // Bold (**text** or __text__)

@@ -4,7 +4,7 @@
 
 PAI Mobile is a Telegram gateway that connects your phone to [Claude Code](https://docs.anthropic.com/en/docs/claude-code), giving you full AI assistant access from anywhere. Send a message on Telegram, get a Claude Code response back — including file access, terminal commands, and multi-turn conversations.
 
-> **Status: Beta** — This is an early release for the [PAI](https://github.com/danielmiessler/fabric) community. It works, it's stable, and it's running daily on the author's machine. But it hasn't been tested across many environments yet. Your feedback will shape what this becomes.
+> **Status: v2.1.0** — Stable release with session memory, image handling, and PAI memory integration. Running daily on the author's machine. Your feedback will shape what this becomes.
 
 ## Why This Exists
 
@@ -23,6 +23,8 @@ This is a PAI plugin, not a replacement. It extends your existing PAI setup with
 **From your phone:**
 - Ask quick questions (weather, lookups, calculations) — routed to fast, stateless lite mode
 - Run complex multi-turn tasks (coding, file management, research) — routed to full Claude Code with tool access
+- **Send images** — photos and image documents are downloaded and forwarded to Claude for analysis
+- **Persistent context** — conversations remember what you were talking about, even across session restarts
 - Switch between multiple conversation sessions
 - Cancel running tasks, manage your queue
 
@@ -200,6 +202,9 @@ Or use standard cron expressions:
 Telegram → index.ts (polling) → classifier.ts (keyword routing)
                                    ├── lite.ts → claude -p (stateless, no tools)
                                    └── full.ts → claude -p (session resume, full tools)
+                                        ↓
+                              transcript.ts (JSONL safety net)
+                              memory.ts (permanent memory + daily logs)
 
 Proactive systems:
   heartbeat.ts → claude -p (read-only) → outbound-queue.ts → Telegram
@@ -209,8 +214,12 @@ Proactive systems:
 - **All inference goes through `claude -p`** — no direct API calls. Uses your Claude Max subscription.
 - **Lite mode** is stateless — every message gets a fresh context. Fast, cheap, no context poisoning.
 - **Full mode** resumes sessions — multi-turn conversation continuity via `--resume`.
+- **Session memory** — three-layer persistence: transcript JSONL (safety net), permanent memory (MEMORY.md), and daily interaction logs. See [Session Memory](#session-memory) below.
+- **Mode stickiness** — sessions auto-lock to full mode for context continuity. Use `/lite` to opt out.
+- **Resume failure detection** — if Claude prunes a session, the bot detects it and re-injects conversation context.
 - **Classifier** uses keyword regex, not LLM — zero overhead routing.
 - **Outbound queue** bundles proactive messages (5 cron results at 8am = 1 Telegram message, not 5).
+- **Image support** — photos and image documents sent via Telegram are downloaded and forwarded to Claude.
 
 ## Customization
 
@@ -226,6 +235,41 @@ Edit `src/classifier.ts` to tune which messages route to lite vs full mode. The 
 
 The included `skills/CreateCron/` skill lets Claude create cron jobs programmatically from natural language when running in full mode. It can read and write to `data/cron/jobs.json` directly.
 
+## Session Memory
+
+PAI Mobile uses a three-layer memory system for conversation persistence:
+
+### Layer 1: Transcript (per-session safety net)
+- **Location:** `data/transcripts/{sessionId}.jsonl`
+- **Format:** Append-only JSONL with `{role, content, ts}` entries
+- **Purpose:** When Claude prunes a session and `--resume` fails silently, the transcript provides fallback context
+- **Injection:** Only when `--resume` is unavailable — never alongside a successful resume
+- Simple truncation (last N entries within character budget), not LLM compaction
+
+### Layer 2: Permanent Memory (MEMORY.md)
+- **Location:** `~/.claude/MEMORY/TELEGRAM/MEMORY.md` + local `data/memory/MEMORY.md`
+- **Size cap:** 8,000 characters
+- **Loaded:** Injected into system prompt on new sessions
+- **Purpose:** Cross-session knowledge that survives session boundaries
+- Integrates with PAI's native memory system — desktop Claude Code sessions can discover Telegram context
+
+### Layer 3: Daily Logs
+- **Location:** `~/.claude/MEMORY/RELATIONSHIP/YYYY-MM/YYYY-MM-DD.md` + local `data/memory/daily/`
+- **Format:** Timestamped interaction bullets (e.g., `[Telegram 14:32] Discussed X`)
+- **Purpose:** PAI's `LoadContext` hook automatically reads today + yesterday's relationship notes, so Telegram interactions surface in desktop sessions with zero configuration
+
+### Resume Failure Recovery
+- Detected by comparing the returned `session_id` to the stored `claudeSessionId`
+- Different IDs = session was pruned, resume failed silently
+- Next call prepends transcript context to the user message
+- `contextRecovery` flag on the session tracks this state
+
+### Design Decisions
+- `--resume` is the **primary** context mechanism; transcript is a **fallback** only
+- Transcript is **never** injected alongside a successful `--resume` (avoids duplicate context)
+- Simple truncation over LLM compaction (deterministic, zero latency, no semantic drift)
+- File-based only, no database
+
 ## Security
 
 - **Chat ID whitelist** — Only Telegram accounts listed in `TELEGRAM_CHAT_ID` can interact with the bot. All other messages are silently dropped.
@@ -235,16 +279,16 @@ The included `skills/CreateCron/` skill lets Claude create cron jobs programmati
 - **Rate limiting** — Per-chat message limits and global concurrent process limits prevent resource exhaustion.
 - **Never commit your `.env`** — It's in `.gitignore`.
 
-## Known Limitations (Beta)
+## Known Limitations
 
 - **macOS only** for the launchd service management. The bot itself runs anywhere Node.js does, but `manage.sh install` generates macOS-specific plists. Linux systemd support is planned.
 - **One poller per bot token** — If another process polls the same Telegram token, both break. The bot runs `deleteWebhook()` at startup to clear conflicts.
 - **Telegram message limit** — Responses over 4096 characters get chunked. Complex output may look fragmented.
-- **Session persistence depends on Claude Code** — If Claude Code prunes old sessions, `--resume` will silently start fresh.
+- **Session pruning** — If Claude Code prunes old sessions, `--resume` fails silently. The transcript safety net detects this and recovers context automatically, but the first response after pruning may have slightly less context.
 
 ## Feedback
 
-This is a beta. If you're a PAI community member testing this out, I'd love to hear:
+If you're a PAI community member testing this out, I'd love to hear:
 
 - What works well, what doesn't
 - What features you'd want next

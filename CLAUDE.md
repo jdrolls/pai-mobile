@@ -1,6 +1,6 @@
 # PAI Mobile Gateway
 
-Telegram bot that routes messages to Claude Code CLI (`claude -p`) with dual-mode routing, multi-session management, heartbeat monitoring, and cron scheduling.
+Telegram bot that routes messages to Claude Code CLI (`claude -p`) with dual-mode routing, multi-session management, session memory, heartbeat monitoring, and cron scheduling.
 
 ## Architecture
 
@@ -28,8 +28,10 @@ Proactive:
 | `src/claude-runner.ts` | Spawns `claude -p` with clean env. ALL modes route through here. Allowlist env for system sessions |
 | `src/classifier.ts` | Synchronous keyword regex → lite/full routing. Zero overhead |
 | `src/lite.ts` | Lite mode handler — STATELESS (no session resume) |
-| `src/full.ts` | Full mode handler with session resume |
-| `src/telegram.ts` | Telegram API: polling, send, typing, chunking, MD→HTML formatting |
+| `src/full.ts` | Full mode handler with session resume, memory + transcript injection |
+| `src/transcript.ts` | Transcript persistence — JSONL append, context formatting for injection |
+| `src/memory.ts` | Permanent memory layer — PAI integration, daily logs, MEMORY.md |
+| `src/telegram.ts` | Telegram API: polling, send, typing, chunking, MD→HTML, image download |
 | `src/sessions.ts` | Multi-session state: create, switch, list, persist to disk |
 | `src/heartbeat.ts` | Periodic AI check-in — reads HEARTBEAT.md, alerts only when actionable |
 | `src/cron.ts` | Scheduled task executor — natural language schedules, skip-if-running, backoff |
@@ -107,7 +109,44 @@ System sessions (heartbeat, cron) always use `default` permission mode with an a
 - Sessions stored at `data/sessions.json` using atomic writes (write to `.tmp`, then rename)
 - **Lite mode is STATELESS** — no `--resume`, fresh system prompt every message. Prevents poisoned context carryover.
 - **Full mode uses `--resume`** for conversation continuity via `claudeSessionId`
+- **Mode stickiness** — once auto-classified as full, session locks to full mode via `modeOverride`. Prevents short follow-up messages ("Yes", "Ok") from dropping to lite and losing context.
 - Auto-naming: first message content becomes session name
+
+## Session Memory (Transcript + Permanent Memory)
+
+Three-layer memory system for conversation persistence:
+
+### Layer 1: Transcript (per-session JSONL)
+- **Location:** `data/transcripts/{sessionId}.jsonl`
+- **Format:** Append-only JSONL: `{role, content, ts}`
+- **Written:** After every full-mode message/response pair
+- **Purpose:** Safety net for when `--resume` fails (Claude prunes sessions)
+- **Injection:** ONLY when `--resume` is unavailable — never concurrent with successful resume
+- Simple truncation (last N entries within 8K char budget), NOT LLM compaction
+
+### Layer 2: Permanent Memory (MEMORY.md)
+- **Location:** `data/memory/MEMORY.md` (local) + `~/.claude/MEMORY/TELEGRAM/MEMORY.md` (PAI-integrated)
+- **Size cap:** 8,000 characters (oldest-first rotation)
+- **Loaded:** Injected into system prompt on new sessions only
+- **Purpose:** Cross-session knowledge that survives session boundaries
+
+### Layer 3: Daily Logs
+- **Location:** `data/memory/daily/YYYY-MM-DD.md` (local) + `~/.claude/MEMORY/RELATIONSHIP/YYYY-MM/YYYY-MM-DD.md` (PAI-integrated)
+- **Format:** Timestamped interaction summaries (user snippet + assistant snippet)
+- **Written:** After every full-mode exchange (async, best-effort)
+- **Purpose:** Audit trail and daily interaction history; PAI path auto-surfaces in desktop sessions
+
+### Resume Failure Recovery
+- Detected by comparing returned `session_id` to stored `claudeSessionId`
+- Different IDs = session was pruned, resume failed silently
+- Next call prepends transcript context to user message (compatible with --resume)
+- `contextRecovery` flag on session tracks this state
+
+### Key Design Decisions (from red team analysis)
+- `--resume` is PRIMARY context mechanism; transcript is FALLBACK only
+- Transcript NEVER injected alongside successful `--resume` (avoids duplicate context / role confusion)
+- Simple truncation over LLM compaction (deterministic, zero latency, no semantic drift)
+- File-based only, no database (matches PAI canonical patterns)
 
 ## Message Queue & Cancellation
 
@@ -145,4 +184,4 @@ System sessions (heartbeat, cron) always use `default` permission mode with an a
 2. **Telegram HTML parse mode** for Claude responses. `formatForTelegram()` converts MD→HTML. Commands still use legacy `Markdown`.
 3. **Long Claude responses:** Telegram limit is 4096 chars. `sendMessage` chunks at 4000.
 4. **Classifier edge cases:** "create a note" matches FULL (contains "create"). Override with `/lite` if misrouted.
-5. **Session continuity depends on `claudeSessionId`:** If Claude Code prunes old sessions, resume will fail silently and start fresh.
+5. **Session continuity depends on `claudeSessionId`:** If Claude Code prunes old sessions, resume will fail silently. The transcript layer detects this and injects context recovery on the next message.

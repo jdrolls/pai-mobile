@@ -1,8 +1,8 @@
-import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync, unlink } from 'fs';
 import { join } from 'path';
 import { config } from './config.js';
 import { log } from './logger.js';
-import { deleteWebhook, formatForTelegram, getUpdates, sendMessage, sendTyping, type TelegramUpdate } from './telegram.js';
+import { deleteWebhook, downloadTelegramImage, formatForTelegram, getUpdates, sendMessage, sendTyping, type TelegramUpdate } from './telegram.js';
 import { classifyMessage, type Mode } from './classifier.js';
 import { handleLite } from './lite.js';
 import { handleFull } from './full.js';
@@ -14,23 +14,31 @@ import {
 import { startHeartbeat, stopHeartbeat, pauseHeartbeat, resumeHeartbeat, getHeartbeatStatus } from './heartbeat.js';
 import { startCron, stopCron, pauseCron, resumeCron, addJob, removeJob, toggleJob, listJobs, runJobNow, type CronJob } from './cron.js';
 import { stopOutboundQueue } from './outbound-queue.js';
+import { ensureTranscriptsDir, appendTranscript } from './transcript.js';
+import { ensureMemoryDirs, initMemoryIfNeeded, appendDailyLog } from './memory.js';
 
-// ─── Queue Persistence ──────────────────────────────────────────
+// --- Helpers ----------------------------------------------------------------
+
+function tryDeleteFile(path: string): void {
+  unlink(path, (err) => {
+    if (err && err.code !== 'ENOENT') log('warn', `Failed to delete temp file ${path}: ${err.message}`);
+  });
+}
+
+// --- Queue Persistence ------------------------------------------------------
 
 const QUEUE_PATH = join(config.dataDir, 'queue.json');
-
-type QueueStore = Record<string, Array<{ text: string; chatId: number }>>;
 
 function loadQueue(): void {
   if (existsSync(QUEUE_PATH)) {
     try {
-      const data: QueueStore = JSON.parse(readFileSync(QUEUE_PATH, 'utf-8'));
+      const data = JSON.parse(readFileSync(QUEUE_PATH, 'utf-8'));
       for (const [chatStr, items] of Object.entries(data)) {
-        if (items.length > 0) {
-          messageQueues.set(chatStr, items);
-          log('info', `Restored ${items.length} queued message(s) for chat ${chatStr}`);
+        if (Array.isArray(items) && items.length > 0) {
+          messageQueues.set(chatStr, items as Array<{ text: string; chatId: number; imagePath?: string }>);
         }
       }
+      log('info', `Loaded ${messageQueues.size} queued chat(s) from disk`);
     } catch (e) {
       log('warn', `Failed to parse queue file, starting fresh: ${e}`);
     }
@@ -38,31 +46,29 @@ function loadQueue(): void {
 }
 
 function saveQueue(): void {
-  const data: QueueStore = {};
+  const obj: Record<string, Array<{ text: string; chatId: number; imagePath?: string }>> = {};
   for (const [chatStr, items] of messageQueues) {
-    if (items.length > 0) data[chatStr] = items;
+    if (items.length > 0) obj[chatStr] = items;
   }
   const tmpPath = QUEUE_PATH + '.tmp';
   try {
-    writeFileSync(tmpPath, JSON.stringify(data, null, 2));
-    renameSync(tmpPath, QUEUE_PATH); // Atomic on POSIX
+    writeFileSync(tmpPath, JSON.stringify(obj, null, 2));
+    renameSync(tmpPath, QUEUE_PATH);
   } catch (e) {
     log('error', `Failed to save queue: ${e}`);
     try { unlinkSync(tmpPath); } catch { /* ignore */ }
   }
 }
 
-// ─── Rate Limiting ──────────────────────────────────────────────
+// --- Rate Limiting ----------------------------------------------------------
 
 const messageTimestamps = new Map<string, number[]>();
 let activeClaude = 0;
 
 function isRateLimited(chatStr: string): boolean {
   const now = Date.now();
-  const windowMs = 60_000;
   const timestamps = messageTimestamps.get(chatStr) ?? [];
-  // Remove timestamps outside the window
-  const recent = timestamps.filter(t => now - t < windowMs);
+  const recent = timestamps.filter(t => now - t < 60_000);
   messageTimestamps.set(chatStr, recent);
   return recent.length >= config.maxMessagesPerMinute;
 }
@@ -73,12 +79,12 @@ function recordMessage(chatStr: string): void {
   messageTimestamps.set(chatStr, timestamps);
 }
 
-// ─── State ──────────────────────────────────────────────────────
+// --- State ------------------------------------------------------------------
 
 const LAST_UPDATE_PATH = join(config.dataDir, 'last-update-id');
 let lastUpdateId: number | undefined;
 const processingChats = new Set<string>();
-const messageQueues = new Map<string, Array<{ text: string; chatId: number }>>();
+const messageQueues = new Map<string, Array<{ text: string; chatId: number; imagePath?: string }>>();
 const activeControllers = new Map<string, AbortController>();
 let proactivePaused = false;
 
@@ -100,7 +106,7 @@ export function isUserProcessing(): boolean {
   return processingChats.size > 0;
 }
 
-// ─── Command Handling ───────────────────────────────────────────
+// --- Command Handling -------------------------------------------------------
 
 async function handleCommand(chatId: number, command: string, args: string): Promise<string | null> {
   const chatStr = String(chatId);
@@ -289,14 +295,15 @@ async function handleCommand(chatId: number, command: string, args: string): Pro
   }
 }
 
-// ─── Message Processing ─────────────────────────────────────────
+// --- Message Processing -----------------------------------------------------
 
-async function processMessage(chatId: number, text: string): Promise<void> {
+async function processMessage(chatId: number, text: string, imagePath?: string): Promise<void> {
   const chatStr = String(chatId);
 
-  // Auth check
+  // Auth check (applies to all message types including images)
   if (!config.authorizedChatIds.includes(chatStr)) {
     log('warn', `Unauthorized message from chat ${chatStr}`);
+    if (imagePath) tryDeleteFile(imagePath);
     return; // Silent drop
   }
 
@@ -319,8 +326,8 @@ async function processMessage(chatId: number, text: string): Promise<void> {
 
   // Rate limit check
   if (isRateLimited(chatStr)) {
-    log('warn', `Rate limited chat ${chatStr}`);
     await sendMessage(chatId, 'Slow down \u2014 too many messages. Try again in a minute.');
+    log('warn', `Rate limited chat ${chatStr}`);
     return;
   }
   recordMessage(chatStr);
@@ -329,7 +336,7 @@ async function processMessage(chatId: number, text: string): Promise<void> {
   if (processingChats.has(chatStr)) {
     // Queue the message
     if (!messageQueues.has(chatStr)) messageQueues.set(chatStr, []);
-    messageQueues.get(chatStr)!.push({ text, chatId });
+    messageQueues.get(chatStr)!.push({ text, chatId, imagePath });
     saveQueue();
     await sendMessage(chatId, '\ud83d\udcac Queued \u2014 I\'ll get to this when my current task finishes.');
     log('info', `Queued message for chat ${chatStr}`);
@@ -341,6 +348,19 @@ async function processMessage(chatId: number, text: string): Promise<void> {
   activeControllers.set(chatStr, controller);
 
   try {
+    // Check concurrent Claude limit
+    if (activeClaude >= config.maxConcurrentClaude) {
+      if (!messageQueues.has(chatStr)) messageQueues.set(chatStr, []);
+      messageQueues.get(chatStr)!.push({ text, chatId, imagePath });
+      saveQueue();
+      processingChats.delete(chatStr);
+      activeControllers.delete(chatStr);
+      await sendMessage(chatId, '\ud83d\udcac Queued \u2014 too many tasks running. I\'ll get to this shortly.');
+      log('info', `Concurrent limit reached, queued message for chat ${chatStr}`);
+      return;
+    }
+    activeClaude++;
+
     // Start typing indicator
     const typingInterval = setInterval(() => sendTyping(chatId), config.typingIntervalMs);
     await sendTyping(chatId);
@@ -351,19 +371,6 @@ async function processMessage(chatId: number, text: string): Promise<void> {
     }, config.longTaskThresholdMs);
 
     try {
-      // Concurrent Claude process limit
-      if (activeClaude >= config.maxConcurrentClaude) {
-        log('warn', `Concurrent Claude limit reached (${activeClaude}/${config.maxConcurrentClaude})`);
-        if (!messageQueues.has(chatStr)) messageQueues.set(chatStr, []);
-        messageQueues.get(chatStr)!.push({ text, chatId });
-        saveQueue();
-        await sendMessage(chatId, '\ud83d\udcac Queued \u2014 processing limit reached, I\'ll get to this shortly.');
-        processingChats.delete(chatStr);
-        activeControllers.delete(chatStr);
-        return;
-      }
-      activeClaude++;
-
       const session = getOrCreateSession(chatStr);
 
       // Auto-name session from first message
@@ -375,7 +382,15 @@ async function processMessage(chatId: number, text: string): Promise<void> {
         mode = session.modeOverride;
         log('info', `Using mode override: ${mode}`);
       } else {
-        mode = classifyMessage(text); // Synchronous — instant keyword heuristic
+        // Classify for logging, but default to full for context continuity.
+        // Both lite and full use sonnet — zero cost difference.
+        // Conversational messages ("Hi", "Yes", "What were we talking about?")
+        // never match full patterns, so the old approach left them stateless.
+        // Now: ALL sessions auto-lock to full. Users can /lite to opt out.
+        const classified = classifyMessage(text);
+        mode = 'full';
+        setModeOverride(session.id, 'full');
+        log('info', `Auto-locked session ${session.id} to full (classified: ${classified}, locked for context continuity)`);
       }
 
       // Process based on mode
@@ -386,8 +401,31 @@ async function processMessage(chatId: number, text: string): Promise<void> {
         const result = await handleLite(text, session.id, session.claudeSessionId, controller.signal);
         responseText = result.text;
       } else {
-        const result = await handleFull(text, session.id, session.claudeSessionId, controller.signal);
+        const result = await handleFull(
+          text, session.id, session.claudeSessionId, controller.signal,
+          { injectTranscript: session.contextRecovery },
+        );
         responseText = result.text;
+
+        // -- Transcript recording (full mode only) --
+        appendTranscript(session.id, 'user', text);
+        appendTranscript(session.id, 'assistant', responseText);
+
+        // -- Resume failure detection --
+        if (result.resumeFailed) {
+          // Next call will inject transcript as context recovery
+          updateSession(session.id, { contextRecovery: true } as Partial<Session>);
+          log('warn', `Session ${session.id} marked for context recovery`);
+        } else if (session.contextRecovery) {
+          // Recovery was applied this turn, clear the flag
+          updateSession(session.id, { contextRecovery: false } as Partial<Session>);
+          log('info', `Context recovery cleared for session ${session.id}`);
+        }
+
+        // -- Daily log (async, best-effort) --
+        try {
+          appendDailyLog(session.name, text, responseText);
+        } catch { /* non-critical */ }
       }
 
       // Update session
@@ -404,6 +442,9 @@ async function processMessage(chatId: number, text: string): Promise<void> {
     log('error', `Error processing message: ${e}`);
     await sendMessage(chatId, `Something went wrong: ${String(e).slice(0, 200)}`);
   } finally {
+    // Clean up temp image file whether processing succeeded or failed
+    if (imagePath) tryDeleteFile(imagePath);
+
     activeClaude = Math.max(0, activeClaude - 1);
     processingChats.delete(chatStr);
     activeControllers.delete(chatStr);
@@ -416,12 +457,12 @@ async function processMessage(chatId: number, text: string): Promise<void> {
       saveQueue();
       log('info', `Draining queue for chat ${chatStr}, ${queue?.length ?? 0} remaining`);
       // Process next message (recursive but not stack-deep due to async)
-      await processMessage(next.chatId, next.text);
+      await processMessage(next.chatId, next.text, next.imagePath);
     }
   }
 }
 
-// ─── Polling Loop ───────────────────────────────────────────────
+// --- Polling Loop -----------------------------------------------------------
 
 async function pollLoop(): Promise<void> {
   log('info', 'Starting polling loop...');
@@ -434,11 +475,43 @@ async function pollLoop(): Promise<void> {
         lastUpdateId = update.update_id + 1;
         saveLastUpdateId(lastUpdateId);
 
-        if (update.message?.text) {
+        const msg = update.message;
+        if (msg?.text) {
           // Fire and forget — don't block polling on processing
-          processMessage(update.message.chat.id, update.message.text).catch(e => {
+          processMessage(msg.chat.id, msg.text).catch(e => {
             log('error', `Unhandled error in processMessage: ${e}`);
           });
+        } else if (msg?.photo || msg?.document) {
+          // Image or document message — download and forward to Claude
+          const chatId = msg.chat.id;
+          const chatStr = String(chatId);
+
+          // Auth check before doing any work
+          if (!config.authorizedChatIds.includes(chatStr)) {
+            log('warn', `Unauthorized image message from chat ${chatStr}`);
+          } else {
+            downloadTelegramImage(msg).then(result => {
+              if (result === null) return; // No image found, skip silently
+
+              if ('unsupported' in result) {
+                // Non-image document (PDF, video, etc.)
+                sendMessage(chatId, `I received a file (${result.unsupported}) but I can only process image files and text. Try sending the image directly or paste the text content.`).catch(() => {});
+                return;
+              }
+
+              // Build message with image reference and optional caption
+              const caption = msg.caption ? `\n\nCaption: ${msg.caption}` : '';
+              const claudeMessage = `[IMAGE ATTACHED: ${result.path}]\n\nPlease use the Read tool to view the image at that path and respond based on what you see.${caption}`;
+
+              processMessage(chatId, claudeMessage, result.path).catch(e => {
+                log('error', `Unhandled error processing image message: ${e}`);
+                tryDeleteFile(result.path);
+              });
+            }).catch(e => {
+              log('error', `Failed to download Telegram image: ${e}`);
+              sendMessage(chatId, `Failed to download your image: ${String(e).slice(0, 100)}`).catch(() => {});
+            });
+          }
         }
       }
     } catch (e) {
@@ -454,7 +527,7 @@ async function pollLoop(): Promise<void> {
   }
 }
 
-// ─── Helpers ────────────────────────────────────────────────────
+// --- Helpers ----------------------------------------------------------------
 
 function formatAge(timestamp: number): string {
   const diff = Date.now() - timestamp;
@@ -467,13 +540,13 @@ function formatAge(timestamp: number): string {
   return `${days}d ago`;
 }
 
-// ─── Startup ────────────────────────────────────────────────────
+// --- Startup ----------------------------------------------------------------
 
 async function main(): Promise<void> {
   const hbStatus = config.heartbeat.enabled ? 'ON' : 'OFF';
   console.log(`
 \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
-\u2551  PAI Mobile Gateway v2.0                  \u2551
+\u2551  PAI Mobile Gateway v2.1.0                \u2551
 \u2551  Telegram \u2192 Claude Code Bridge              \u2551
 \u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563
 \u2551  Bot: ${(config.botName + '                    ').slice(0, 20)}                \u2551
@@ -489,9 +562,13 @@ async function main(): Promise<void> {
   loadQueue();
   loadLastUpdateId();
 
-  // Drain any queued messages from previous crash
+  // Initialize transcript and memory directories
+  ensureTranscriptsDir();
+  ensureMemoryDirs();
+  initMemoryIfNeeded();
+
+  // Drain any queued messages from previous session
   if (messageQueues.size > 0) {
-    // Snapshot and clear — processMessage handles its own queue logic
     const snapshot = new Map(messageQueues);
     messageQueues.clear();
     saveQueue();
