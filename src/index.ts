@@ -25,6 +25,70 @@ function tryDeleteFile(path: string): void {
   });
 }
 
+/**
+ * Strip PAI output formatting from Claude's response.
+ * Claude picks up PAI format rules from ~/.claude/CLAUDE.md (═══ PAI headers,
+ * 🗒️ TASK, 📃 CONTENT, 🔧 CHANGE, ✅ VERIFY, 🗣️ lines).
+ * Telegram users just want the actual content.
+ */
+function stripPaiFormatting(text: string): string {
+  if (!text.includes('═══') && !text.includes('🗒️') && !text.includes(`🗣️ ${config.botName}:`)) return text;
+
+  const lines = text.split('\n');
+  const kept: string[] = [];
+  let skipSection = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      if (!skipSection) kept.push('');
+      continue;
+    }
+
+    // PAI header lines (═══ PAI ═══, ════ PAI | NATIVE MODE ═══, etc.)
+    if (/═{3,}/.test(trimmed)) { skipSection = false; continue; }
+
+    // Metadata lines to skip
+    if (/^🗒️\s*TASK:/i.test(trimmed)) { skipSection = false; continue; }
+    if (/^🔄\s*ITERATION/i.test(trimmed)) { skipSection = false; continue; }
+
+    // Sections to skip including their sub-bullets
+    if (/^🔧\s*CHANGE/i.test(trimmed)) { skipSection = true; continue; }
+    if (/^✅\s*VERIFY/i.test(trimmed)) { skipSection = true; continue; }
+    if (/^📋\s*SUMMARY/i.test(trimmed)) { skipSection = true; continue; }
+
+    // CONTENT: — extract text after prefix
+    const contentMatch = trimmed.match(/^📃\s*CONTENT:\s*(.*)/i);
+    if (contentMatch) {
+      skipSection = false;
+      if (contentMatch[1]) kept.push(contentMatch[1]);
+      continue;
+    }
+
+    // Bot name summary line — use as fallback if no other content collected yet
+    const botNamePattern = new RegExp(`^🗣️\\s*${config.botName}:\\s*(.*)`, 'i');
+    const doraMatch = trimmed.match(botNamePattern) || trimmed.match(/^🗣️\s*\w+:\s*(.*)/i);
+    if (doraMatch) {
+      skipSection = false;
+      if (kept.filter(l => l.trim()).length === 0 && doraMatch[1]) {
+        kept.push(doraMatch[1]);
+      }
+      continue;
+    }
+
+    // Skip sub-bullets in CHANGE/VERIFY/SUMMARY sections
+    if (skipSection && /^[-•]/.test(trimmed)) continue;
+
+    // Regular content — keep
+    skipSection = false;
+    kept.push(line);
+  }
+
+  const result = kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  return result || text;
+}
+
 // --- Queue Persistence ------------------------------------------------------
 
 const QUEUE_PATH = join(config.dataDir, 'queue.json');
@@ -431,9 +495,9 @@ async function processMessage(chatId: number, text: string, imagePath?: string):
       // Update session
       updateSession(session.id, { messageCount: session.messageCount + 1 });
 
-      // Send response with mode indicator
-      const modeLabel = mode === 'lite' ? '\ud83d\udca1' : '\ud83d\udd27';
-      await sendMessage(chatId, `${modeLabel} ${formatForTelegram(responseText)}`, 'HTML');
+      // Strip PAI formatting and send clean response
+      responseText = stripPaiFormatting(responseText);
+      await sendMessage(chatId, formatForTelegram(responseText), 'HTML');
     } finally {
       clearInterval(typingInterval);
       clearTimeout(longTaskTimer);
@@ -546,7 +610,7 @@ async function main(): Promise<void> {
   const hbStatus = config.heartbeat.enabled ? 'ON' : 'OFF';
   console.log(`
 \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
-\u2551  PAI Mobile Gateway v2.1.0                \u2551
+\u2551  PAI Mobile Gateway v2.1.1                \u2551
 \u2551  Telegram \u2192 Claude Code Bridge              \u2551
 \u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563
 \u2551  Bot: ${(config.botName + '                    ').slice(0, 20)}                \u2551
