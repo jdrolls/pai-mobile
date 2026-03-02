@@ -1,6 +1,6 @@
 {
   "name": "pai-mobile",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "PAI Mobile Gateway — Telegram interface to Claude Code with dual-mode routing, heartbeat, and cron",
   "type": "module",
   "scripts": {

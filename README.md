@@ -4,7 +4,7 @@
 
 PAI Mobile is a Telegram gateway that connects your phone to [Claude Code](https://docs.anthropic.com/en/docs/claude-code), giving you full AI assistant access from anywhere. Send a message on Telegram, get a Claude Code response back — including file access, terminal commands, and multi-turn conversations.
 
-> **Status: v2.1.0** — Stable release with session memory, image handling, and PAI memory integration. Running daily on the author's machine. Your feedback will shape what this becomes.
+> **Status: v2.1.2** — Stable release with session memory, image handling, PAI memory integration, and skill command discovery. Running daily on the author's machine. Your feedback will shape what this becomes.
 
 ## Why This Exists
 
@@ -52,6 +52,13 @@ This is a PAI plugin, not a replacement. It extends your existing PAI setup with
 | `/cron toggle <id>` | Enable/disable a task |
 | `/cron run <id>` | Manually trigger a task |
 | `/help` | Show all commands |
+| `/<skill>` | Run any installed PAI skill (see below) |
+
+**PAI Skill Commands:**
+
+The gateway automatically discovers skills installed at `~/.claude/skills/` and registers them as Telegram bot commands. Type `/` in your chat to see the full menu of available skills alongside built-in commands.
+
+For example, if you have a `Research` skill installed, `/research quantum computing` will invoke it through Claude Code in full mode. Skills are discovered at startup — restart the gateway to pick up newly installed skills.
 
 ## Prerequisites
 
@@ -201,10 +208,11 @@ Or use standard cron expressions:
 ```
 Telegram → index.ts (polling) → classifier.ts (keyword routing)
                                    ├── lite.ts → claude -p (stateless, no tools)
-                                   └── full.ts → claude -p (session resume, full tools)
-                                        ↓
-                              transcript.ts (JSONL safety net)
-                              memory.ts (permanent memory + daily logs)
+                                   ├── full.ts → claude -p (session resume, full tools)
+                                   │    ↓
+                                   │  transcript.ts (JSONL safety net)
+                                   │  memory.ts (permanent memory + daily logs)
+                                   └── skills.ts (PAI skill discovery → command menu)
 
 Proactive systems:
   heartbeat.ts → claude -p (read-only) → outbound-queue.ts → Telegram

@@ -178,6 +178,32 @@ Three-layer memory system for conversation persistence:
 - `/resume` — restarts proactive behavior
 - `/cron add "name" "schedule" "prompt"` — create a cron job with natural language schedule
 
+## Skill Command Discovery
+
+At startup, the gateway scans `~/.claude/skills/` and registers all discovered skills as Telegram bot commands.
+
+### How it works
+1. `src/skills.ts` reads each `SKILL.md` frontmatter (name + description)
+2. Names are normalized to Telegram-safe commands (lowercase, no hyphens — e.g., `AlexHormoziPitch` → `/alexhormozipitch`)
+3. Built-in commands (`/new`, `/sessions`, etc.) take priority — no skill can override them
+4. All commands registered via `setMyCommands` API at startup — visible in Telegram's `/` menu
+5. When a user sends `/research quantum computing`, it's rewritten to `"Use the Research skill: quantum computing"` and routed through full mode
+6. `full-system.md` has a skill routing hint that tells Claude to invoke skills via the Skill tool
+
+### Key files
+| File | Role |
+|------|------|
+| `src/skills.ts` | Skill discovery — scans dirs, parses YAML frontmatter |
+| `src/telegram.ts` | `registerBotCommands()` — wraps `setMyCommands` API |
+| `src/index.ts` | `skillMap`, routing logic, startup registration, `/help` |
+| `prompts/full-system.md` | Skill routing hint for Claude |
+
+### Notes
+- Skills are scanned once at startup. Restart gateway to pick up new skills.
+- Telegram practical limit: ~50 total commands (13 built-in + up to 37 skills in menu). All skills are still routable — only the menu registration is capped.
+- Registration is non-fatal — if `setMyCommands` fails, bot works without command menu.
+- `CORE` and `PAI` directories are excluded (internal infrastructure).
+
 ## Known Gotchas
 
 1. **Only ONE poller per bot token.** If another process polls the same token, both break. `deleteWebhook()` runs at startup to clear conflicts.

@@ -142,6 +142,16 @@ export async function deleteWebhook(): Promise<void> {
   await apiCall('deleteWebhook', {});
 }
 
+export interface BotCommand {
+  command: string;
+  description: string;
+}
+
+/** Register bot commands visible in the Telegram / menu */
+export async function registerBotCommands(commands: BotCommand[]): Promise<void> {
+  await apiCall('setMyCommands', { commands });
+}
+
 function escapeHtml(text: string): string {
   return text
     .replace(/&/g, '&amp;')

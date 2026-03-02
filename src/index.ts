@@ -2,7 +2,8 @@ import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync, unlink
 import { join } from 'path';
 import { config } from './config.js';
 import { log } from './logger.js';
-import { deleteWebhook, downloadTelegramImage, formatForTelegram, getUpdates, sendMessage, sendTyping, type TelegramUpdate } from './telegram.js';
+import { deleteWebhook, downloadTelegramImage, formatForTelegram, getUpdates, registerBotCommands, sendMessage, sendTyping, type BotCommand, type TelegramUpdate } from './telegram.js';
+import { discoverSkills, type DiscoveredSkill } from './skills.js';
 import { classifyMessage, type Mode } from './classifier.js';
 import { handleLite } from './lite.js';
 import { handleFull } from './full.js';
@@ -151,6 +152,14 @@ const processingChats = new Set<string>();
 const messageQueues = new Map<string, Array<{ text: string; chatId: number; imagePath?: string }>>();
 const activeControllers = new Map<string, AbortController>();
 let proactivePaused = false;
+
+// --- Skill Discovery ---------------------------------------------------------
+const builtinCommands = new Set([
+  'new', 'sessions', 'switch', 'lite', 'full', 'auto',
+  'cancel', 'status', 'heartbeat', 'pause', 'resume',
+  'cron', 'help', 'start',
+]);
+let skillMap = new Map<string, DiscoveredSkill>();
 
 function loadLastUpdateId(): void {
   if (existsSync(LAST_UPDATE_PATH)) {
@@ -332,7 +341,7 @@ async function handleCommand(chatId: number, command: string, args: string): Pro
     }
 
     case '/help': {
-      return [
+      const lines = [
         `*${config.botName} Commands:*`,
         '',
         '/new [name] \u2014 Create a new session',
@@ -351,7 +360,21 @@ async function handleCommand(chatId: number, command: string, args: string): Pro
         '/resume \u2014 Resume proactive behavior',
         '',
         '/help \u2014 This message',
-      ].join('\n');
+      ];
+
+      if (skillMap.size > 0) {
+        lines.push('', `*PAI Skills (${skillMap.size}):*`);
+        const sorted = [...skillMap.values()].sort((a, b) => a.command.localeCompare(b.command));
+        for (const s of sorted.slice(0, 20)) {
+          const desc = s.description.length > 60 ? s.description.slice(0, 57) + '...' : s.description;
+          lines.push(`/${s.command} \u2014 ${desc}`);
+        }
+        if (sorted.length > 20) {
+          lines.push(`...and ${sorted.length - 20} more`);
+        }
+      }
+
+      return lines.join('\n');
     }
 
     default:
@@ -385,7 +408,20 @@ async function processMessage(chatId: number, text: string, imagePath?: string):
       await sendMessage(chatId, response, 'Markdown');
       return;
     }
-    // If not a recognized command, treat as a regular message
+
+    // Check if it's a skill command (e.g., /research quantum computing)
+    const skillCmd = cleanCommand.slice(1); // remove leading /
+    const skill = skillMap.get(skillCmd);
+    if (skill) {
+      // Rewrite as a natural language request for Claude with skill routing
+      const skillArgs = args.trim();
+      text = skillArgs
+        ? `Use the ${skill.dirName} skill: ${skillArgs}`
+        : `Use the ${skill.dirName} skill`;
+      log('info', `Skill command /${skillCmd} → "${text}"`);
+      // Fall through to normal message processing below
+    }
+    // If not a recognized command or skill, treat as a regular message
   }
 
   // Rate limit check
@@ -652,6 +688,50 @@ async function main(): Promise<void> {
     log('info', 'Webhook cleared');
   } catch (e) {
     log('warn', `Failed to clear webhook: ${e}`);
+  }
+
+  // Discover PAI skills and register Telegram bot commands
+  try {
+    const discoveredSkills = discoverSkills();
+    log('info', `Discovered ${discoveredSkills.length} PAI skills`);
+
+    // Build skill map, excluding collisions with built-in commands
+    for (const skill of discoveredSkills) {
+      if (builtinCommands.has(skill.command)) {
+        log('warn', `Skill "${skill.name}" collides with built-in /${skill.command}, skipping`);
+        continue;
+      }
+      skillMap.set(skill.command, skill);
+    }
+
+    // Register all commands with Telegram
+    const botCommands: BotCommand[] = [
+      { command: 'new', description: 'Create a new conversation session' },
+      { command: 'sessions', description: 'List all sessions' },
+      { command: 'switch', description: 'Switch to a different session' },
+      { command: 'lite', description: 'Lock to lite mode (fast, no tools)' },
+      { command: 'full', description: 'Lock to full mode (Claude Code)' },
+      { command: 'auto', description: 'Restore auto-detect mode' },
+      { command: 'cancel', description: 'Cancel current task and clear queue' },
+      { command: 'status', description: 'Current session info' },
+      { command: 'heartbeat', description: 'Check heartbeat status' },
+      { command: 'cron', description: 'Manage scheduled tasks' },
+      { command: 'pause', description: 'Pause all proactive behavior' },
+      { command: 'resume', description: 'Resume proactive behavior' },
+      { command: 'help', description: 'Show all commands' },
+    ];
+
+    // Add skill commands (Telegram practical limit: ~50 commands total)
+    const maxSkillCommands = Math.max(0, 50 - botCommands.length);
+    const skillCommands = [...skillMap.values()]
+      .sort((a, b) => a.command.localeCompare(b.command))
+      .slice(0, maxSkillCommands)
+      .map(s => ({ command: s.command, description: s.description }));
+
+    await registerBotCommands([...botCommands, ...skillCommands]);
+    log('info', `Registered ${botCommands.length + skillCommands.length} bot commands (${botCommands.length} built-in + ${skillCommands.length} skills)`);
+  } catch (e) {
+    log('warn', `Failed to register bot commands (non-fatal): ${e}`);
   }
 
   // Start proactive systems
