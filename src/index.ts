@@ -69,11 +69,11 @@ function stripPaiFormatting(text: string): string {
 
     // Bot name summary line — use as fallback if no other content collected yet
     const botNamePattern = new RegExp(`^🗣️\\s*${config.botName}:\\s*(.*)`, 'i');
-    const doraMatch = trimmed.match(botNamePattern) || trimmed.match(/^🗣️\s*\w+:\s*(.*)/i);
-    if (doraMatch) {
+    const summaryMatch = trimmed.match(botNamePattern) || trimmed.match(/^🗣️\s*\w+:\s*(.*)/i);
+    if (summaryMatch) {
       skipSection = false;
-      if (kept.filter(l => l.trim()).length === 0 && doraMatch[1]) {
-        kept.push(doraMatch[1]);
+      if (kept.filter(l => l.trim()).length === 0 && summaryMatch[1]) {
+        kept.push(summaryMatch[1]);
       }
       continue;
     }
