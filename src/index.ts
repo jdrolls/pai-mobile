@@ -152,6 +152,7 @@ const processingChats = new Set<string>();
 const messageQueues = new Map<string, Array<{ text: string; chatId: number; imagePath?: string }>>();
 const activeControllers = new Map<string, AbortController>();
 let proactivePaused = false;
+const taskStartTimes = new Map<string, number>();
 
 // --- Skill Discovery ---------------------------------------------------------
 const builtinCommands = new Set([
@@ -235,6 +236,11 @@ async function handleCommand(chatId: number, command: string, args: string): Pro
     case '/status': {
       const session = getOrCreateSession(chatStr);
       const mode = session.modeOverride ?? 'auto';
+      const isProcessing = processingChats.has(chatStr);
+      const taskStart = taskStartTimes.get(chatStr);
+      const taskInfo = isProcessing && taskStart
+        ? `*Active Task:* Running for ${Math.round((Date.now() - taskStart) / 60_000)}m`
+        : '*Active Task:* None';
       return [
         `*Session:* ${session.name} (${session.id})`,
         `*Mode:* ${mode}`,
@@ -242,6 +248,7 @@ async function handleCommand(chatId: number, command: string, args: string): Pro
         `*Claude Session:* ${session.claudeSessionId ?? 'none'}`,
         `*Created:* ${new Date(session.createdAt).toLocaleDateString()}`,
         `*Last Active:* ${formatAge(session.lastActive)}`,
+        taskInfo,
       ].join('\n');
     }
 
@@ -444,6 +451,7 @@ async function processMessage(chatId: number, text: string, imagePath?: string):
   }
 
   processingChats.add(chatStr);
+  taskStartTimes.set(chatStr, Date.now());
   const controller = new AbortController();
   activeControllers.set(chatStr, controller);
 
@@ -469,6 +477,13 @@ async function processMessage(chatId: number, text: string, imagePath?: string):
     const longTaskTimer = setTimeout(() => {
       sendMessage(chatId, '\u23f3 This one\'s taking a few minutes \u2014 I\'ll ping you when it\'s done.').catch(() => {});
     }, config.longTaskThresholdMs);
+
+    // Periodic progress pings for long-running tasks
+    const taskStart = Date.now();
+    const progressPingInterval = setInterval(() => {
+      const mins = Math.round((Date.now() - taskStart) / 60_000);
+      sendMessage(chatId, `⏳ Still working... (${mins} min elapsed). Use /cancel to stop.`).catch(() => {});
+    }, config.progressPingIntervalMs);
 
     try {
       const session = getOrCreateSession(chatStr);
@@ -537,6 +552,7 @@ async function processMessage(chatId: number, text: string, imagePath?: string):
     } finally {
       clearInterval(typingInterval);
       clearTimeout(longTaskTimer);
+      clearInterval(progressPingInterval);
     }
   } catch (e) {
     log('error', `Error processing message: ${e}`);
@@ -548,6 +564,7 @@ async function processMessage(chatId: number, text: string, imagePath?: string):
     activeClaude = Math.max(0, activeClaude - 1);
     processingChats.delete(chatStr);
     activeControllers.delete(chatStr);
+    taskStartTimes.delete(chatStr);
 
     // Drain message queue
     const queue = messageQueues.get(chatStr);
@@ -746,16 +763,38 @@ async function main(): Promise<void> {
 }
 
 // Handle graceful shutdown
-function shutdown(signal: string): void {
+let isShuttingDown = false;
+
+async function shutdown(signal: string): Promise<void> {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+
   log('info', `Received ${signal}, shutting down...`);
   stopHeartbeat();
   stopCron();
+
+  // If tasks are in progress, notify user and abort them
+  if (processingChats.size > 0) {
+    log('info', `Aborting ${processingChats.size} active task(s) for shutdown`);
+    for (const [chatStr, controller] of activeControllers) {
+      controller.abort();
+      const chatId = parseInt(chatStr);
+      if (!isNaN(chatId)) {
+        try {
+          await sendMessage(chatId, '🔄 Gateway restarting — your task was interrupted. Send your message again when the bot is back.');
+        } catch { /* best effort */ }
+      }
+    }
+    // Brief pause to let abort signals propagate
+    await new Promise(r => setTimeout(r, 2000));
+  }
+
   stopOutboundQueue();
   process.exit(0);
 }
 
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => { shutdown('SIGINT'); });
+process.on('SIGTERM', () => { shutdown('SIGTERM'); });
 
 main().catch(e => {
   log('error', `Fatal error: ${e}`);

@@ -74,9 +74,10 @@ export const config = {
 
   // Timeouts
   liteTimeoutMs: 120_000,       // 2 min for lite mode
-  fullTimeoutMs: 10 * 60_000,   // 10 min for full mode
+  fullTimeoutMs: 4 * 60 * 60_000, // 4 hours safety cap — user uses /cancel for hung tasks
   classifierTimeoutMs: 60_000,  // 60s for classifier
   longTaskThresholdMs: 15_000,  // 15s before sending "this will take a bit" ping
+  progressPingIntervalMs: 5 * 60_000, // Ping user every 5 min during long tasks
 
   // Rate limits
   maxMessagesPerMinute: parseInt(process.env.MAX_MESSAGES_PER_MINUTE ?? '20', 10),

@@ -85,6 +85,8 @@ export async function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult
   return new Promise<ClaudeRunResult>((resolve) => {
     let stdout = '';
     let stderr = '';
+    let timedOut = false;
+    let cancelled = false;
 
     const proc = spawn('claude', args, {
       cwd: config.claudeCwd,
@@ -92,17 +94,36 @@ export async function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult
       stdio: ['ignore', 'pipe', 'pipe'],  // stdin must be 'ignore' — 'pipe' blocks claude
     });
 
+    const timeoutMin = Math.round(timeout / 60_000);
     const timer = setTimeout(() => {
-      log('warn', `Claude timed out after ${timeout}ms`);
+      timedOut = true;
+      log('warn', `Claude safety timeout after ${timeoutMin}m — process killed`);
       proc.kill('SIGTERM');
       setTimeout(() => proc.kill('SIGKILL'), 5000);
     }, timeout);
 
+    // Health check: detect zombie processes (close event never fired)
+    const healthCheck = setInterval(() => {
+      try {
+        process.kill(proc.pid!, 0); // kill(0) tests existence without signaling
+      } catch {
+        log('warn', `Claude process ${proc.pid} appears dead (no close event). Forcing resolve.`);
+        clearTimeout(timer);
+        clearInterval(healthCheck);
+        resolve({
+          text: stdout.trim() || 'The task ended unexpectedly without output. Try again.',
+          error: 'Process disappeared without close event',
+        });
+      }
+    }, 30_000);
+
     // Allow external cancellation via AbortSignal
     if (opts.signal) {
       const onAbort = () => {
+        cancelled = true;
         log('info', 'Claude process cancelled by user');
         clearTimeout(timer);
+        clearInterval(healthCheck);
         proc.kill('SIGTERM');
         setTimeout(() => proc.kill('SIGKILL'), 3000);
       };
@@ -118,8 +139,9 @@ export async function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult
       stderr += data.toString();
     });
 
-    proc.on('close', (code) => {
+    proc.on('close', (code, signal) => {
       clearTimeout(timer);
+      clearInterval(healthCheck);
 
       // Parse the JSON result
       let text = '';
@@ -149,12 +171,36 @@ export async function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult
         text = stdout.trim();
       }
 
-      if (code !== 0 && !text) {
-        log('error', `claude exited ${code}`, { stderr: stderr.slice(0, 500) });
+      // Build user-friendly error message for non-zero / signal exits
+      if ((code !== 0 && code !== null) || signal || timedOut || cancelled) {
+        // If we got usable text despite the error, return it (partial result)
+        if (text) {
+          const suffix = timedOut ? '\n\n⏱ *Note: this response may be incomplete — the task timed out.*' : '';
+          log('info', `Claude produced partial output (${text.length} chars) despite ${timedOut ? 'timeout' : cancelled ? 'cancel' : `exit ${code}/${signal}`}`);
+          resolve({
+            text: text + suffix,
+            sessionId,
+          });
+          return;
+        }
+
+        // No text — build a descriptive error
+        let errorMsg: string;
+        if (timedOut) {
+          errorMsg = `This task hit the ${timeoutMin > 60 ? Math.round(timeoutMin / 60) + '-hour' : timeoutMin + '-minute'} safety limit and was stopped. For long tasks, use /cancel if they appear hung.`;
+        } else if (cancelled) {
+          errorMsg = 'Task was cancelled.';
+        } else if (signal) {
+          errorMsg = `Claude was interrupted (${signal}).`;
+        } else {
+          errorMsg = `Error running Claude: ${stderr.slice(0, 200) || `exit code ${code}`}`;
+        }
+
+        log('error', `claude exited code=${code} signal=${signal} timedOut=${timedOut}`, { stderr: stderr.slice(0, 500) });
         resolve({
-          text: `Error running Claude: ${stderr.slice(0, 200) || `exit code ${code}`}`,
+          text: errorMsg,
           sessionId,
-          error: stderr,
+          error: stderr || errorMsg,
         });
         return;
       }
@@ -168,6 +214,7 @@ export async function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult
 
     proc.on('error', (err) => {
       clearTimeout(timer);
+      clearInterval(healthCheck);
       log('error', `Failed to spawn claude: ${err.message}`);
       resolve({
         text: `Failed to start Claude Code: ${err.message}`,
