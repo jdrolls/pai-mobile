@@ -99,6 +99,29 @@ The gateway runs a periodic heartbeat that checks `~/.claude/HEARTBEAT.md` and a
 - The heartbeat is read-only from the AI's perspective — it evaluates the checklist but cannot modify it during a heartbeat tick
 - `HEARTBEAT_OK` = silence (no Telegram message). Only actionable alerts are delivered.
 
+## Memory Flush
+
+When you learn important facts, decisions, or preferences during a conversation, preserve them by including a `<memory>` tag at the end of your response. The gateway will parse these and save them to permanent memory.
+
+**Format:**
+```
+<memory>
+## Facts
+- {{USER_NAME}}'s deploy target is a VPS named `web-01`
+## Decisions
+- Chose Hono over Express for the new API
+## Preferences
+- Prefers concise responses on mobile
+</memory>
+```
+
+**Rules:**
+- Only emit `<memory>` when there's genuinely important information worth remembering across sessions
+- Use the section headers (Facts, Decisions, Preferences) to categorize entries
+- Keep entries as concise bullet points
+- Don't emit memory for routine or ephemeral exchanges
+- The `<memory>` tag is stripped from the response before sending to Telegram
+
 ## Telegram Commands (for reference)
 The user can use these directly in chat:
 - `/pause` — pause all proactive behavior (heartbeat + cron)

@@ -5,7 +5,7 @@ import { log } from './logger.js';
 import { setClaudeSessionId } from './sessions.js';
 import { runClaude } from './claude-runner.js';
 import { formatTranscriptForContext } from './transcript.js';
-import { loadMemory } from './memory.js';
+import { loadMemory, appendMemoryEntries, loadRecentRelationshipContext } from './memory.js';
 
 let fullSystemPrompt: string;
 
@@ -46,15 +46,17 @@ export async function handleFull(
   let effectiveMessage = message;
 
   if (!claudeSessionId) {
-    // -- New session: inject base prompt + permanent memory + transcript --
+    // -- New session: inject base prompt + permanent memory + desktop context + transcript --
     const memory = loadMemory();
+    const desktopContext = loadRecentRelationshipContext();
     const transcript = formatTranscriptForContext(mobileSessionId);
 
     effectiveSystemPrompt = basePrompt
       + (memory ? `\n\n## Permanent Memory\n${memory}` : '')
+      + (desktopContext ? `\n\n## Recent Desktop Activity\n${desktopContext}` : '')
       + transcript;
 
-    log('info', `New session: injecting system prompt (${effectiveSystemPrompt.length} chars)`);
+    log('info', `New session: injecting system prompt (${effectiveSystemPrompt.length} chars, desktop context: ${desktopContext.length} chars)`);
   } else if (options?.injectTranscript) {
     // -- Context recovery: --resume failed last time, re-seed with transcript --
     // Prepend context to the user message (compatible with --resume)
@@ -90,12 +92,39 @@ export async function handleFull(
     setClaudeSessionId(mobileSessionId, result.sessionId);
   }
 
-  log('info', `Full mode response: ${result.text.length} chars, session: ${result.sessionId}${resumeFailed ? ' [RESUME FAILED]' : ''}`);
+  // -- Memory flush: parse <memory> tags from response --
+  const memoryContent = extractMemoryTags(result.text);
+  if (memoryContent) {
+    try {
+      appendMemoryEntries(memoryContent);
+      log('info', `Memory flush: saved ${memoryContent.length} chars from <memory> tags`);
+    } catch (e) {
+      log('error', `Memory flush failed: ${e}`);
+    }
+  }
+
+  // Strip <memory> tags from user-visible response
+  const cleanText = result.text.replace(/<memory>[\s\S]*?<\/memory>/g, '').trim();
+
+  log('info', `Full mode response: ${cleanText.length} chars, session: ${result.sessionId}${resumeFailed ? ' [RESUME FAILED]' : ''}`);
 
   return {
-    text: result.text,
+    text: cleanText,
     sessionId: result.sessionId,
     error: result.error,
     resumeFailed,
   };
+}
+
+/** Extract content from <memory> tags in Claude's response */
+function extractMemoryTags(text: string): string | null {
+  const matches = text.match(/<memory>([\s\S]*?)<\/memory>/g);
+  if (!matches || matches.length === 0) return null;
+
+  const content = matches
+    .map(m => m.replace(/<\/?memory>/g, '').trim())
+    .filter(Boolean)
+    .join('\n');
+
+  return content || null;
 }

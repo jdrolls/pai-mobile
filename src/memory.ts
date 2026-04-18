@@ -33,6 +33,9 @@ const LOCAL_DAILY_DIR = join(LOCAL_MEMORY_DIR, 'daily');
 
 const MAX_MEMORY_CHARS = 8_000;
 
+// Section priority for rotation: Facts dropped first, Preferences kept longest
+const SECTION_PRIORITY = ['## Facts', '## Decisions', '## Preferences'] as const;
+
 export function ensureMemoryDirs(): void {
   // Local gateway dirs
   mkdirSync(LOCAL_MEMORY_DIR, { recursive: true });
@@ -110,6 +113,145 @@ export function appendDailyLog(
   }
 }
 
+/**
+ * Append flushed memory entries into existing MEMORY.md under the correct section.
+ * Entries should be formatted as `## SectionName\n- entry` lines.
+ * If MEMORY.md exceeds MAX_MEMORY_CHARS after append, rotate using section-aware pruning.
+ */
+export function appendMemoryEntries(entries: string): void {
+  let current = loadMemory() || getDefaultTemplate();
+
+  // Parse entries into sections
+  const entryLines = entries.split('\n');
+  let currentSection = '## Facts'; // default section for unheaded entries
+
+  for (const line of entryLines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    if (trimmed.startsWith('## ')) {
+      currentSection = trimmed;
+      continue;
+    }
+
+    // Ensure bullet format
+    const bullet = trimmed.startsWith('- ') ? trimmed : `- ${trimmed}`;
+
+    // Insert under the matching section in current content
+    const sectionIdx = current.indexOf(currentSection);
+    if (sectionIdx !== -1) {
+      // Find end of section (next ## or EOF)
+      const afterSection = current.indexOf('\n##', sectionIdx + currentSection.length);
+      const insertAt = afterSection !== -1 ? afterSection : current.length;
+      current = current.slice(0, insertAt) + '\n' + bullet + current.slice(insertAt);
+    } else {
+      // Section doesn't exist — append it
+      current += `\n\n${currentSection}\n${bullet}`;
+    }
+  }
+
+  // Apply section-aware rotation if over limit
+  if (current.length > MAX_MEMORY_CHARS) {
+    current = rotateSections(current);
+  }
+
+  saveMemory(current);
+}
+
+/**
+ * Section-aware rotation: drop entries from lowest-priority sections first.
+ * Priority order: Facts (dropped first) → Decisions → Preferences (kept longest).
+ */
+function rotateSections(content: string): string {
+  // For each section in priority order (lowest first), remove oldest entries until under limit
+  for (const section of SECTION_PRIORITY) {
+    if (content.length <= MAX_MEMORY_CHARS) break;
+
+    const sectionIdx = content.indexOf(section);
+    if (sectionIdx === -1) continue;
+
+    const afterHeader = content.indexOf('\n', sectionIdx);
+    if (afterHeader === -1) continue;
+
+    const nextSection = content.indexOf('\n##', afterHeader + 1);
+    const sectionEnd = nextSection !== -1 ? nextSection : content.length;
+
+    // Get bullet lines in this section
+    const sectionContent = content.slice(afterHeader + 1, sectionEnd);
+    const bullets = sectionContent.split('\n').filter(l => l.trim().startsWith('- '));
+
+    // Remove oldest bullets (from the top) until under limit
+    let removed = 0;
+    while (content.length > MAX_MEMORY_CHARS && removed < bullets.length) {
+      const bulletToRemove = bullets[removed];
+      const bulletIdx = content.indexOf(bulletToRemove, afterHeader);
+      if (bulletIdx !== -1) {
+        // Remove the bullet line + its newline
+        const lineEnd = content.indexOf('\n', bulletIdx);
+        const endIdx = lineEnd !== -1 ? lineEnd + 1 : content.length;
+        content = content.slice(0, bulletIdx) + content.slice(endIdx);
+      }
+      removed++;
+    }
+  }
+
+  return content.slice(0, MAX_MEMORY_CHARS);
+}
+
+function getDefaultTemplate(): string {
+  return `# ${config.botName} Telegram Memory
+
+## About ${config.userName}
+- Timezone: ${config.timezone}
+
+## Facts
+<!-- Key facts from conversations -->
+
+## Decisions
+<!-- Important decisions made -->
+
+## Preferences
+<!-- Learned preferences -->
+
+## Active Context
+<!-- Current topics and ongoing work -->
+`;
+}
+
+/**
+ * Load recent PAI RELATIONSHIP logs (desktop activity).
+ * Reads today + yesterday from ~/.claude/MEMORY/RELATIONSHIP/YYYY-MM/.
+ * Returns formatted string for system prompt injection, or empty string.
+ */
+export function loadRecentRelationshipContext(): string {
+  const now = new Date();
+  const dates: string[] = [];
+
+  // Today and yesterday
+  for (let i = 0; i < 2; i++) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    const dateStr = d.toISOString().split('T')[0]; // YYYY-MM-DD
+    const yearMonth = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    const filePath = join(PAI_RELATIONSHIP_DIR, yearMonth, `${dateStr}.md`);
+
+    if (existsSync(filePath)) {
+      try {
+        const content = readFileSync(filePath, 'utf-8').trim();
+        if (content) dates.push(content);
+      } catch (e) {
+        log('error', `Failed to read relationship log ${filePath}: ${e}`);
+      }
+    }
+  }
+
+  if (dates.length === 0) return '';
+
+  // Cap at 4KB to avoid bloating system prompt
+  const combined = dates.join('\n\n');
+  return combined.slice(0, 4_000);
+}
+
 /** Save content to MEMORY.md (writes to both PAI and local, atomic) */
 export function saveMemory(content: string): void {
   ensureMemoryDirs();
@@ -140,17 +282,7 @@ export function saveMemory(content: string): void {
 export function initMemoryIfNeeded(): void {
   ensureMemoryDirs();
   if (!existsSync(PAI_TELEGRAM_MEMORY) && !existsSync(LOCAL_MEMORY_PATH)) {
-    const template = `# ${config.botName} Telegram Memory
-
-## About ${config.userName}
-- Timezone: ${config.timezone}
-
-## Preferences
-<!-- Learned preferences from Telegram conversations -->
-
-## Active Context
-<!-- Current topics and ongoing work discussed via Telegram -->
-`;
+    const template = getDefaultTemplate();
     saveMemory(template);
     log('info', 'Initialized TELEGRAM MEMORY.md with default template');
   }
