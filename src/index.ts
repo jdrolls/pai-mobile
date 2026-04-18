@@ -469,9 +469,9 @@ async function processMessage(chatId: number, text: string, imagePath?: string):
     }
     activeClaude++;
 
-    // Start typing indicator
-    const typingInterval = setInterval(() => sendTyping(chatId), config.typingIntervalMs);
+    // Start typing indicator immediately (2.2 — before claude -p spawn, not after)
     await sendTyping(chatId);
+    const typingInterval = setInterval(() => sendTyping(chatId), 4_000); // Re-send every 4s (Telegram expires after 5s)
 
     // Ping user if processing takes longer than threshold
     const longTaskTimer = setTimeout(() => {
@@ -506,6 +506,20 @@ async function processMessage(chatId: number, text: string, imagePath?: string):
         mode = 'full';
         setModeOverride(session.id, 'full');
         log('info', `Auto-locked session ${session.id} to full (classified: ${classified}, locked for context continuity)`);
+      }
+
+      // ── 1.2: Transparent context recovery notification ──
+      if (session.contextRecovery) {
+        await sendMessage(chatId, '🔄 Reconnecting to our conversation — context was reset by Claude Code.', 'HTML');
+        log('info', `Sent context recovery notification for session ${session.id}`);
+      }
+
+      // ── 1.3: Session age warning ──
+      const sessionAgeDays = (Date.now() - session.lastActive) / (1_000 * 60 * 60 * 24);
+      if (sessionAgeDays > 7 && session.messageCount > 0) {
+        const days = Math.round(sessionAgeDays);
+        await sendMessage(chatId, `⚠️ This session is ${days} days old — context may be limited. Use /new to start fresh.`, 'HTML');
+        log('info', `Sent session age warning (${days}d) for session ${session.id}`);
       }
 
       // Process based on mode

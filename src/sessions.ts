@@ -13,6 +13,7 @@ export interface Session {
   createdAt: number;
   lastActive: number;
   contextRecovery?: boolean; // True when --resume failed and transcript should be injected
+  parentSessionId?: string;  // Claude session ID of the parent session when resume failed (lineage tracking)
 }
 
 interface SessionStore {
@@ -126,10 +127,13 @@ export function autoNameSession(sessionId: string, message: string): void {
   }
 }
 
-export function setClaudeSessionId(sessionId: string, claudeSessionId: string): void {
+export function setClaudeSessionId(sessionId: string, claudeSessionId: string, parentSessionId?: string): void {
   const session = store.sessions[sessionId];
   if (session) {
     session.claudeSessionId = claudeSessionId;
+    if (parentSessionId) {
+      session.parentSessionId = parentSessionId;
+    }
     saveSessions();
   }
 }

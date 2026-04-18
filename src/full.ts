@@ -87,9 +87,15 @@ export async function handleFull(
     resumeFailed = true;
   }
 
+  // -- Session lineage tracking --
+  if (resumeFailed && claudeSessionId) {
+    // Record that this new session descended from the pruned one
+    log('info', `Session lineage: ${result.sessionId} descends from pruned ${claudeSessionId}`);
+  }
+
   // Save the Claude session ID for future continuity
   if (result.sessionId) {
-    setClaudeSessionId(mobileSessionId, result.sessionId);
+    setClaudeSessionId(mobileSessionId, result.sessionId, resumeFailed ? claudeSessionId : undefined);
   }
 
   // -- Memory flush: parse <memory> tags from response --
