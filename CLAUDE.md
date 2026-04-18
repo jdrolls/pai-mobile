@@ -39,9 +39,12 @@ Proactive:
 | `src/config.ts` | Loads `.env` + heartbeat config from project root, validates |
 | `src/logger.ts` | File + console logger |
 | `prompts/lite-system.md` | Lite mode system prompt (uses `{{BOT_NAME}}`/`{{USER_NAME}}` placeholders) |
-| `prompts/full-system.md` | Full mode system prompt with self-modification protection |
+| `prompts/full-system.md` | Full mode system prompt with self-modification protection + `<memory>` tag contract |
+| `prompts/memory-synthesis.md` | Prompt for a nightly memory-synthesis cron — consolidates daily logs into MEMORY.md |
 | `data/heartbeat-config.json` | Heartbeat config: interval, active hours, model, circuit breaker |
+| `data/heartbeat-state.json` | Heartbeat persistent state: trendNotes, consecutiveOkCount, lastAlertTopic |
 | `data/cron/jobs.json` | Persistent cron job store |
+| `data/cron-results/{jobId}/` | Last 7 outputs per job, used by `contextFromJobs` chaining |
 | `manage.sh` | Service lifecycle: install/start/stop/restart/status/logs/dev |
 | `com.pai-mobile.plist.example` | launchd auto-start config template |
 
@@ -81,6 +84,7 @@ System sessions (heartbeat, cron) always use `default` permission mode with an a
 - **Circuit breaker** — 3 consecutive failures pause heartbeat for 1 hour, sends one alert about the pause.
 - **Active hours** — only runs during configured window (default 07:00-22:00).
 - **Defers to user** — skips tick if any user message is being processed.
+- **Trend tracking** — persistent state at `data/heartbeat-state.json` (lastAlertTopic, consecutiveOkCount, lastAlertedAt, trendNotes). Loaded each tick and injected into the prompt so the AI can distinguish recurring patterns from one-offs. Trend notes capped at 20 (oldest rotated out).
 - Config: `data/heartbeat-config.json` (copy from `data/heartbeat-config.example.json`)
 - Checklist: `~/.claude/HEARTBEAT.md`
 
@@ -91,9 +95,13 @@ System sessions (heartbeat, cron) always use `default` permission mode with an a
 - **Skip-if-running** — prevents concurrent executions of the same job.
 - **Exponential backoff** — 30s, 1m, 5m, 15m, 1h on consecutive failures.
 - **5-minute minimum interval** — prevents runaway schedules.
-- **Max 20 jobs** — hard limit to prevent resource exhaustion.
+- **Max 25 jobs** — hard limit to prevent resource exhaustion.
 - **Hot-reload** — gateway detects external changes to `jobs.json` via mtime, reloads within 60s.
 - **deleteAfterRun** — one-shot jobs auto-remove after successful execution.
+- **Per-job `timeoutMs`** — override the default 5-min cap for long jobs.
+- **Silent mode** — set `"silent": true` on a job OR have the job output exactly `SILENT` to run without sending to Telegram (cron still logs the outcome).
+- **Job context chaining** — `contextFromJobs: ["jobId1", "jobId2"]` injects those jobs' latest outputs (2KB each) into this job's prompt. Useful for analysis jobs that build on earlier data pulls.
+- **Result persistence** — each run's output is written to `data/cron-results/{jobId}/{iso-ts}.md`, last 7 retained per job.
 - Job store: `data/cron/jobs.json`
 
 ## Outbound Queue
@@ -110,6 +118,8 @@ System sessions (heartbeat, cron) always use `default` permission mode with an a
 - **Lite mode is STATELESS** — no `--resume`, fresh system prompt every message. Prevents poisoned context carryover.
 - **Full mode uses `--resume`** for conversation continuity via `claudeSessionId`
 - **Mode stickiness** — once auto-classified as full, session locks to full mode via `modeOverride`. Prevents short follow-up messages ("Yes", "Ok") from dropping to lite and losing context.
+- **Session lineage** — when `--resume` fails silently (Claude pruned the session), the gateway captures the old `claudeSessionId` as `parentSessionId` on the new session, preserving the chain.
+- **Context recovery UX** — on a session marked `contextRecovery: true`, the first reply begins with "🔄 Reconnecting to our conversation — context was reset". Sessions idle >7 days get a "this session is Xd old — use /new" warning.
 - Auto-naming: first message content becomes session name
 
 ## Session Memory (Transcript + Permanent Memory)
@@ -147,6 +157,12 @@ Three-layer memory system for conversation persistence:
 - Transcript NEVER injected alongside successful `--resume` (avoids duplicate context / role confusion)
 - Simple truncation over LLM compaction (deterministic, zero latency, no semantic drift)
 - File-based only, no database (matches PAI canonical patterns)
+
+### Memory Flush (`<memory>` tags)
+The AI preserves cross-session knowledge by emitting `<memory>...</memory>` tags at the end of full-mode responses. The gateway parses them, appends to `MEMORY.md` under section headers (Facts / Decisions / Preferences), and strips the tags from the user-visible response. When MEMORY.md exceeds 8KB, section-aware rotation drops oldest entries — Facts first, Preferences last (preserved longest). The contract is documented in `prompts/full-system.md`.
+
+### Desktop Context Injection
+On new full sessions, `loadRecentRelationshipContext()` reads today + yesterday from `~/.claude/MEMORY/RELATIONSHIP/YYYY-MM/` (up to 4KB) and injects it into the system prompt under `## Recent Desktop Activity`. This gives mobile Claude awareness of desktop Claude's recent work — cross-device continuity for PAI users.
 
 ## Message Queue & Cancellation
 
