@@ -39,6 +39,14 @@ function cleanEnv(): Record<string, string> {
   delete env.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
   // Remove API key so claude uses Max plan auth instead of API billing
   delete env.ANTHROPIC_API_KEY;
+  // Ensure bun is on PATH so PAI security hooks (#!/usr/bin/env bun) actually run.
+  // The launchd PATH omits ~/.bun/bin, which silently disables SecurityValidator for
+  // all user sessions — leaving bypassPermissions mode completely unguarded.
+  const home = env.HOME ?? process.env.HOME ?? '';
+  const bunPath = `${home}/.bun/bin`;
+  if (env.PATH && !env.PATH.includes(bunPath)) {
+    env.PATH = `${bunPath}:${env.PATH}`;
+  }
   return env;
 }
 
@@ -49,6 +57,12 @@ function cleanEnvForAutomated(): Record<string, string> {
   for (const key of ALLOWED) {
     if (process.env[key]) env[key] = process.env[key]!;
   }
+  // launchd PATH is minimal (/usr/bin:/bin:/usr/sbin:/sbin) — bun lives at ~/.bun/bin
+  // and is not on it. SessionEnd hooks use `#!/usr/bin/env bun` and fail without this.
+  const home = env.HOME ?? process.env.HOME ?? '';
+  const bunPath = `${home}/.bun/bin`;
+  const brewPath = '/opt/homebrew/bin';
+  env.PATH = [bunPath, brewPath, env.PATH ?? ''].filter(Boolean).join(':');
   return env;
 }
 
