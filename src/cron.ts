@@ -2,7 +2,7 @@
  * Cron scheduler — evaluates job schedules on 1-minute ticks, spawns claude -p
  * for due jobs, persists state. Supports natural language schedule parsing.
  */
-import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync, readdirSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { CronExpressionParser } from 'cron-parser';
@@ -33,11 +33,14 @@ export interface CronJob {
   };
   sessionTarget: 'isolated' | 'main';
   model?: string;
+  timeoutMs?: number;       // per-job timeout override (default: 300_000 = 5 min)
+  silent?: boolean;          // run job but suppress Telegram output
   payload: {
     message: string;
   };
   requiresTools: boolean;
   deleteAfterRun: boolean;
+  contextFromJobs?: string[]; // Job IDs whose latest output is injected as context
   state: {
     lastRunAtMs: number;
     lastStatus: 'ok' | 'error' | 'pending';
@@ -56,7 +59,7 @@ interface JobStore {
 // ─── Constants ──────────────────────────────────────────────────
 const TICK_INTERVAL_MS = 60_000;  // 1-minute evaluation tick
 const MIN_SCHEDULE_INTERVAL_MS = 5 * 60_000;  // 5 minutes minimum
-const MAX_JOBS = 20;
+const MAX_JOBS = 25;
 const BACKOFF_SCHEDULE = [30_000, 60_000, 300_000, 900_000, 3_600_000]; // 30s, 1m, 5m, 15m, 1h
 
 // ─── State ──────────────────────────────────────────────────────
@@ -259,12 +262,18 @@ async function executeJob(job: CronJob): Promise<void> {
   log('info', `Cron executing: "${job.name}" (${job.id})`);
 
   try {
+    // ── 3.3: Build context from dependent jobs ──
+    const jobContext = buildJobContext(job);
+    const messageWithContext = jobContext
+      ? `[Scheduled Task: ${job.name}]\n${jobContext}${job.payload.message}`
+      : `[Scheduled Task: ${job.name}]\n\n${job.payload.message}`;
+
     const result = await runClaude({
-      message: `[Scheduled Task: ${job.name}]\n\n${job.payload.message}`,
+      message: messageWithContext,
       systemPrompt: CRON_SYSTEM_PROMPT,
       noSessionPersistence: true,
       model: job.model || config.fullModel,
-      timeoutMs: 300_000, // 5 min max for cron jobs
+      timeoutMs: job.timeoutMs ?? 300_000, // per-job override or 5 min default
       systemSession: true,
     });
 
@@ -275,16 +284,24 @@ async function executeJob(job: CronJob): Promise<void> {
       job.state.consecutiveErrors = 0;
       job.state.backoffUntilMs = 0;
 
-      // Deliver result to Telegram
-      enqueueOutbound({
-        chatId,
-        text: result.text,
-        source: 'cron',
-        jobName: job.name,
-        timestamp: Date.now(),
-      });
+      // ── 3.3: Save output for cross-job reference ──
+      saveJobResult(job.id, job.name, result.text);
 
-      log('info', `Cron completed: "${job.name}" — ${result.text.length} chars`);
+      // SILENT convention: if job is silent OR output is exactly "SILENT", suppress Telegram
+      const outputSilent = result.text.trim().toUpperCase() === 'SILENT';
+      if (job.silent || outputSilent) {
+        log('info', `Cron completed (silent): "${job.name}" — ${result.text.length} chars`);
+      } else {
+        // Deliver result to Telegram
+        enqueueOutbound({
+          chatId,
+          text: result.text,
+          source: 'cron',
+          jobName: job.name,
+          timestamp: Date.now(),
+        });
+        log('info', `Cron completed: "${job.name}" — ${result.text.length} chars`);
+      }
     }
   } catch (e) {
     handleJobError(job, String(e));
@@ -437,4 +454,68 @@ function checkForExternalChanges(): void {
 
 function sanitizeName(name: string): string {
   return name.replace(/[^\w\s-]/g, '').trim().slice(0, 50);
+}
+
+// ─── Output Persistence (3.3) ──────────────────────────────────
+
+const MAX_RESULTS_PER_JOB = 7;
+
+function getResultsDir(jobId: string): string {
+  const dir = join(storePath, '..', '..', 'cron-results', jobId);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+/** Save job output to data/cron-results/{jobId}/{timestamp}.md */
+function saveJobResult(jobId: string, jobName: string, output: string): void {
+  try {
+    const dir = getResultsDir(jobId);
+    const filename = `${new Date().toISOString().replace(/[:.]/g, '-')}.md`;
+    writeFileSync(join(dir, filename), `# ${jobName} — ${new Date().toISOString()}\n\n${output}`);
+    pruneJobResults(dir);
+  } catch (e) {
+    log('error', `Failed to save cron result for ${jobId}: ${e}`);
+  }
+}
+
+/** Keep only the last N results per job */
+function pruneJobResults(dir: string): void {
+  try {
+    const files = readdirSync(dir)
+      .filter(f => f.endsWith('.md'))
+      .sort(); // ISO timestamps sort naturally
+    while (files.length > MAX_RESULTS_PER_JOB) {
+      const oldest = files.shift()!;
+      unlinkSync(join(dir, oldest));
+    }
+  } catch { /* best effort */ }
+}
+
+/** Load the latest result from a job for context injection */
+function loadLatestResult(jobId: string): string | null {
+  try {
+    const dir = getResultsDir(jobId);
+    const files = readdirSync(dir).filter(f => f.endsWith('.md')).sort();
+    if (files.length === 0) return null;
+    return readFileSync(join(dir, files[files.length - 1]), 'utf-8');
+  } catch {
+    return null;
+  }
+}
+
+/** Build context from dependent jobs' latest outputs */
+function buildJobContext(job: CronJob): string {
+  if (!job.contextFromJobs || job.contextFromJobs.length === 0) return '';
+
+  const contexts: string[] = [];
+  for (const depJobId of job.contextFromJobs) {
+    const result = loadLatestResult(depJobId);
+    if (result) {
+      contexts.push(`--- Context from job ${depJobId} ---\n${result.slice(0, 2000)}`);
+    }
+  }
+
+  return contexts.length > 0
+    ? `\n\n[Previous job outputs for reference:]\n${contexts.join('\n\n')}\n\n`
+    : '';
 }
