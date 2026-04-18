@@ -219,14 +219,35 @@ function chunkMessage(text: string): string[] {
       break;
     }
 
-    // Try to break at newline
-    let breakIdx = remaining.lastIndexOf('\n', limit);
-    if (breakIdx < limit * 0.5) {
-      // Try space
+    // 1. Try paragraph boundary (double newline)
+    let breakIdx = remaining.lastIndexOf('\n\n', limit);
+    if (breakIdx >= limit * 0.3) {
+      breakIdx += 1; // Include the first newline, split before second
+    } else {
+      // 2. Try single newline
+      breakIdx = remaining.lastIndexOf('\n', limit);
+    }
+
+    if (breakIdx < limit * 0.3) {
+      // 3. Try sentence boundary (. followed by space or newline)
+      const sentenceRegion = remaining.slice(0, limit);
+      let sentenceIdx = -1;
+      for (let i = Math.min(limit, sentenceRegion.length) - 1; i >= limit * 0.3; i--) {
+        if (sentenceRegion[i] === '.' && (sentenceRegion[i + 1] === ' ' || sentenceRegion[i + 1] === '\n')) {
+          sentenceIdx = i + 1; // Break after the period
+          break;
+        }
+      }
+      breakIdx = sentenceIdx >= 0 ? sentenceIdx : -1;
+    }
+
+    if (breakIdx < limit * 0.3) {
+      // 4. Try space
       breakIdx = remaining.lastIndexOf(' ', limit);
     }
+
     if (breakIdx < limit * 0.3) {
-      // Hard break
+      // 5. Hard break as last resort
       breakIdx = limit;
     }
 
