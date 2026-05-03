@@ -3,6 +3,9 @@ import { join } from 'path';
 import { config } from './config.js';
 import { log } from './logger.js';
 import { deleteWebhook, downloadTelegramImage, formatForTelegram, getUpdates, registerBotCommands, sendMessage, sendTyping, type BotCommand, type TelegramUpdate } from './telegram.js';
+import {
+  decideVoiceReply, downloadTelegramVoice, sendVoice, setVoiceMode, synthesizeSpeech, transcribeAudio,
+} from './voice.js';
 import { discoverSkills, type DiscoveredSkill } from './skills.js';
 import { classifyMessage, type Mode } from './classifier.js';
 import { handleLite } from './lite.js';
@@ -24,6 +27,34 @@ function tryDeleteFile(path: string): void {
   unlink(path, (err) => {
     if (err && err.code !== 'ENOENT') log('warn', `Failed to delete temp file ${path}: ${err.message}`);
   });
+}
+
+/**
+ * Send the bot's reply, mirroring the user's input mode. If the inbound was a
+ * voice note (voice mode for this chat), synthesize TTS and send via sendVoice;
+ * if TTS fails or the reply is too long, fall back to a normal text message —
+ * the message is NEVER dropped.
+ */
+async function sendReply(chatId: number | string, text: string): Promise<void> {
+  const chatStr = String(chatId);
+  const decision = decideVoiceReply(chatStr, text);
+  if (decision.useVoice) {
+    let oggPath: string | null = null;
+    try {
+      oggPath = await synthesizeSpeech(text);
+      await sendVoice(chatId, oggPath);
+      return;
+    } catch (e) {
+      log('warn', `TTS failed (${e}), falling back to text`);
+      // fall through to text fallback below
+    } finally {
+      if (oggPath) tryDeleteFile(oggPath);
+    }
+  } else {
+    log('info', `Voice reply skipped: ${decision.reason}`);
+  }
+  // Text fallback — also covers normal text-mode replies
+  await sendMessage(chatId, formatForTelegram(text), 'HTML');
 }
 
 /**
@@ -562,7 +593,7 @@ async function processMessage(chatId: number, text: string, imagePath?: string):
 
       // Strip PAI formatting and send clean response
       responseText = stripPaiFormatting(responseText);
-      await sendMessage(chatId, formatForTelegram(responseText), 'HTML');
+      await sendReply(chatId, responseText);
     } finally {
       clearInterval(typingInterval);
       clearTimeout(longTaskTimer);
@@ -607,7 +638,38 @@ async function pollLoop(): Promise<void> {
         saveLastUpdateId(lastUpdateId);
 
         const msg = update.message;
-        if (msg?.text) {
+        if (msg?.voice) {
+          // Voice note — download OGG, transcribe via Whisper, then route through the
+          // existing text handler unchanged. Mark the chat as voice-mode so the
+          // outbound reply mirrors back as TTS (mirror-by-default).
+          const chatId = msg.chat.id;
+          const chatStr = String(chatId);
+          if (!config.authorizedChatIds.includes(chatStr)) {
+            log('warn', `Unauthorized voice message from chat ${chatStr}`);
+          } else {
+            (async () => {
+              let oggPath: string | null = null;
+              try {
+                oggPath = await downloadTelegramVoice(msg.voice!);
+                const transcript = await transcribeAudio(oggPath);
+                log('info', `Voice transcribed (${transcript.length} chars): ${transcript.slice(0, 80)}...`);
+                setVoiceMode(chatStr, 'voice');
+                await processMessage(chatId, transcript);
+              } catch (e) {
+                // STT failure → text fallback with error note (NEVER drop the message)
+                log('error', `Voice processing failed: ${e}`);
+                setVoiceMode(chatStr, 'text');
+                try {
+                  await sendMessage(chatId, `I couldn't transcribe that voice note (${String(e).slice(0, 120)}). Please send it as text.`);
+                } catch { /* best effort */ }
+              } finally {
+                if (oggPath) tryDeleteFile(oggPath);
+              }
+            })();
+          }
+        } else if (msg?.text) {
+          // Text inbound — clear voice mode so reply goes back as text (mirror-by-default)
+          setVoiceMode(String(msg.chat.id), 'text');
           // Fire and forget — don't block polling on processing
           processMessage(msg.chat.id, msg.text).catch(e => {
             log('error', `Unhandled error in processMessage: ${e}`);
