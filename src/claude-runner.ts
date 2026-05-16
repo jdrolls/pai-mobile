@@ -37,8 +37,12 @@ function cleanEnv(): Record<string, string> {
   delete env.CLAUDE_CODE_ENTRYPOINT;
   delete env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS;
   delete env.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
-  // Remove API key so claude uses Max plan auth instead of API billing
+  // BILLING: Always use subscription. Anthropic's credential precedence chain puts
+  // BOTH ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN above CLAUDE_CODE_OAUTH_TOKEN,
+  // so either one in env will silently override OAuth — leaking subscription work
+  // onto the programmatic-credit pool (2026-06-15 gate). Scrub both.
   delete env.ANTHROPIC_API_KEY;
+  delete env.ANTHROPIC_AUTH_TOKEN;
   // Ensure bun is on PATH so PAI security hooks (#!/usr/bin/env bun) actually run.
   // The launchd PATH omits ~/.bun/bin, which silently disables SecurityValidator for
   // all user sessions — leaving bypassPermissions mode completely unguarded.
@@ -71,6 +75,12 @@ export async function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult
     '-p', opts.message,
     '--output-format', 'json',  // json = single result (stream-json requires --verbose)
     '--model', opts.model ?? config.fullModel,
+    // Subscription-safe lockdown: match canonical PAI/TOOLS/Inference.ts flag
+    // pattern. Empty --tools / --setting-sources disable tool surface and
+    // settings file loading so the 2026-06-15 programmatic credit gate cannot
+    // misclassify these spawns as agentic API workloads.
+    '--tools', '',
+    '--setting-sources', '',
   ];
 
   if (opts.systemPrompt) {
